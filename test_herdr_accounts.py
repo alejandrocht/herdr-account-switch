@@ -159,6 +159,31 @@ class AccountFlow(unittest.TestCase):
         self.assertEqual(result["group"], str(self.managed))
         self.assertIsNone(result["api_key"])
 
+    def test_terminal_label_lasts_only_for_its_managed_process(self):
+        pending = self.call("enrol")
+        self.call("login", pending["login_id"])
+        events = self.root / "labels.jsonl"
+        hc = self.root / "hc"
+        hc.write_text("#!/usr/bin/env python3\nimport json, os, sys\n"
+                      "with open(os.environ['HERDR_TEST_LABELS'], 'a') as out:\n"
+                      "    out.write(json.dumps(sys.argv[1:]) + '\\n')\n")
+        hc.chmod(0o700)
+        self.env.update(HC_TERMINAL_ID="fixture-terminal", HERDR_TEST_LABELS=str(events),
+                        PATH=str(self.root) + os.pathsep + self.env["PATH"])
+        for arguments in (("launch", "--", "--version"),
+                          ("shell", "--", "-c", "exit 0"),
+                          ("shell", "--", "-c", "codex --version")):
+            with self.subTest(arguments=arguments):
+                events.unlink(missing_ok=True)
+                result = subprocess.run(self.command(*arguments), env=self.env,
+                                        capture_output=True, text=True, timeout=10)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                labels = [json.loads(line) for line in events.read_text().splitlines()]
+                self.assertEqual(labels, [
+                    ["label", "fixture-terminal", "herdr.accounts=" + str(self.managed)],
+                    ["label", "fixture-terminal", "herdr.accounts="],
+                ])
+
 
 if __name__ == "__main__":
     unittest.main()

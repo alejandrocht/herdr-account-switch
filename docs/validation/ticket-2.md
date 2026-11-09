@@ -1,8 +1,8 @@
 # Ticket #2: validation checkpoint
 
-Recorded 2026-11-09. This ticket remains open pending native interaction and
-real-account evidence. The user postponed account validation until they have
-access to their accounts.
+Recorded 2026-11-09. The initial account validation was postponed; the user
+subsequently completed the official login. Real-account results are recorded
+below. Final keyboard interaction verification remains pending.
 
 ## Verified
 
@@ -26,7 +26,8 @@ and do not count as evidence for the latest UI changes.
 
 Use the dedicated App home `~/.config/herdr-app/previews/codex-accounts-ticket2`.
 The normal App home and external applications have not been reconfigured.
-The pending official login was cancelled; no real account was registered.
+The initial pending login was cancelled. A subsequent official login registered
+the first account successfully, as recorded below.
 
 1. Bring the preview window itself to the foreground. Inspect the empty selector,
    then use Tab/Shift-Tab and Enter/Space to verify navigation and activation.
@@ -52,3 +53,26 @@ border and theme color as the shipped tabs mod. Source and installed-mod native
 checks passed. A fresh frame confirmed matching border pixels on both sides of
 the join. This check covers the reported divider defect only; the outstanding
 account and keyboard validation above remains pending.
+
+## Real-account demonstration
+
+- The user completed the official browser login. The public controller reports
+  one identifiable active profile and a completed registration.
+- A native preview tab launched the public `launch` workflow with a read-only
+  Codex request. Its saved final response matched `HERDR_ACCOUNT_OK`.
+- Another native preview tab used the public managed `shell` workflow and the
+  ordinary `codex` command. Its saved response matched `HERDR_SHELL_OK`, and the
+  command exited successfully. No model tools or project changes were requested.
+- The connected selector was inspected in a fresh native frame: identity and
+  both launch actions were visible. The image remains local and is not published.
+- Native Herdr keeps a normal shell after an explicit command finishes. The live
+  check revealed that our account label previously survived that transition.
+  The controller now supervises its managed process and releases its own label
+  before returning. Nested Codex commands preserve their managed shell's label.
+  A public-CLI regression reproduced the stale label before the fix; all ten
+  controller tests passed afterward. The real normal-command tab also returned
+  to an ordinary zsh with no managed-account label.
+
+This establishes initial registration and authenticated requests for the first
+account. It does not establish cross-account conversation continuity or prove
+keyboard interactions that have not yet been exercised.

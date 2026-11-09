@@ -47,6 +47,10 @@ uses the private account home, removes inherited API-key authentication, and
 disables the shared Codex daemon. Login/logout and remote-account redirection
 are handled through the selector rather than the managed Codex command.
 
+When a managed program exits, its account label is released before Herdr returns
+to an ordinary shell. Codex commands inside a managed terminal keep that
+terminal's label until the managed shell itself exits.
+
 Cancelling the login terminates only the login process started for that
 registration. A failed login leaves the account list unchanged. Profiles and
 login state persist in the private account home, not in the App layout.

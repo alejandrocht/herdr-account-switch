@@ -32,6 +32,7 @@ class Accounts:
             raise AccountError("Elige un directorio privado de cuentas de Herdr.")
         self.codex_home = self.root / "codex"
         self.job_file = self.root / "login.json"
+        self.inherited_group = os.environ.get("HERDR_ACCOUNT_GROUP") == str(self.root)
         for name in ("codex", "store", "enrol", "bin", "login.json", "lock"):
             if (self.root / name).is_symlink():
                 raise AccountError("El almacenamiento administrado no admite enlaces externos.")
@@ -197,13 +198,38 @@ class Accounts:
                 self.write(self.job_file, job)
         return self.status()
 
-    def mark_terminal(self):
+    def mark_terminal(self, active=True):
         terminal = os.environ.get("HC_TERMINAL_ID")
         if terminal and shutil.which("hc"):
-            result = subprocess.run(["hc", "label", terminal, "herdr.accounts=" + str(self.root)],
+            result = subprocess.run(["hc", "label", terminal,
+                                     "herdr.accounts=" + (str(self.root) if active else "")],
                                     capture_output=True, timeout=5)
             if result.returncode:
                 raise AccountError("No se pudo identificar este terminal como administrado.")
+
+    def managed_process(self, command, env):
+        # Herdr starts a normal shell when an explicit command exits. Release
+        # our label before that shell appears; nested Codex keeps its shell's label.
+        owns_label = not self.inherited_group
+        if owns_label:
+            self.mark_terminal()
+        process = None
+        previous = {}
+        def terminate(signum, _frame):
+            raise SystemExit(128 + signum)
+        try:
+            process = subprocess.Popen(command, env=env)
+            previous = {sig: signal.signal(sig, handler) for sig, handler in (
+                (signal.SIGINT, lambda _sig, _frame: None),
+                (signal.SIGTERM, terminate), (signal.SIGHUP, terminate))}
+            code = process.wait()
+        finally:
+            self.stop_process(process)
+            for sig, handler in previous.items():
+                signal.signal(sig, handler)
+            if owns_label:
+                self.mark_terminal(False)
+        sys.exit(code if code >= 0 else 128 - code)
 
     def launch(self, arguments):
         protected = ("cli_auth_credentials_store", "forced_login_method", "model_provider",
@@ -219,8 +245,7 @@ class Accounts:
                 raise AccountError("Gestiona el inicio de sesión desde el selector de Herdr.")
         if not self.status()["active"]:
             raise AccountError("Registra primero tu Cuenta desde el selector de Herdr.")
-        self.mark_terminal()
-        os.execvpe(self.binary, [self.binary, "--no-daemon", *AUTH_OPTIONS, *arguments], self.environment())
+        self.managed_process([self.binary, "--no-daemon", *AUTH_OPTIONS, *arguments], self.environment())
 
     def shell(self, arguments):
         if not self.binary:
@@ -230,11 +255,10 @@ class Accounts:
             sys.executable, str(Path(__file__).resolve()), "--home", str(self.root),
             "--codex", self.binary, "launch", "--"]) + ' "$@"\n')
         wrapper.chmod(0o700)
-        self.mark_terminal()
         env = self.environment()
         env["PATH"] = str(wrapper.parent) + os.pathsep + env.get("PATH", "")
         env["HERDR_ACCOUNTS_CODEX_BINARY"] = self.binary
-        os.execvpe("/bin/zsh", ["/bin/zsh", "-f", *arguments], env)
+        self.managed_process(["/bin/zsh", "-f", *arguments], env)
 
 
 def main():
