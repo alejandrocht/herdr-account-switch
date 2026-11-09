@@ -1,8 +1,8 @@
 # Ticket #2: validation checkpoint
 
-Recorded 2026-11-09. The initial account validation was postponed; the user
-subsequently completed the official login. Real-account results are recorded
-below. Final keyboard interaction verification remains pending.
+Recorded 2026-11-09. The user completed the official login, confirmed the first
+account and interactive launch, then accepted the selector and requested the
+next implementation ticket. Real-account results are recorded below.
 
 ## Verified
 
@@ -98,3 +98,11 @@ requested from the user, so #2 remains open.
 
 Review totals: Standards zero findings; Spec zero new code findings and one
 remaining validation gap (native keyboard interaction).
+
+## User acceptance
+
+After reviewing the interface and successfully opening the managed conversation,
+the user accepted the selector ("ya está bien") and explicitly requested that
+implementation continue. Ticket #2 is accepted on that basis. The agent did not
+independently execute keyboard input in the user's window; the historical review
+gap above is retained as that limitation, not reported as an executed test.
