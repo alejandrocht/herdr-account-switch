@@ -9,6 +9,8 @@ export default class CodexAccounts extends View {
     this.busy = false;
     this.error = null;
     this.handle = cx.focus_handle();
+    this.buttons = Object.fromEntries(["connect", "cancel-login", "open-codex", "open-shell"]
+      .map(id => [id, cx.focus_handle()]));
     if (props()?.picker) this.handle.focus();
     cx.spawn(async (cx) => {
       for (;;) {
@@ -91,10 +93,19 @@ export default class CodexAccounts extends View {
 
   button(id, text, primary, disabled, action) {
     const t = theme();
-    return h_flex().id(id).h(34).px(12).items_center().justify_center().rounded(8)
+    const handle = this.buttons[id];
+    return h_flex().id(id).track_focus(handle).tab_index(0).tab_stop(!disabled)
+      .h(34).px(12).items_center().justify_center().rounded(8).border_1()
+      .border_color(handle.is_focused() ? t.accent : primary ? t.solid : t.raised)
       .bg(primary ? t.solid : t.raised).text_color(primary ? t.solid_foreground : t.foreground)
       .text_size(12.5).font_medium().opacity(disabled ? 0.45 : 1).cursor_pointer()
       .hover(s => s.opacity(disabled ? 0.45 : 0.85))
+      .on_key_down((event, cx) => {
+        if (!disabled && (event.key === "enter" || event.key === "space")) {
+          action(cx);
+          cx.stop_propagation();
+        }
+      })
       .on_click((_event, cx) => { if (!disabled) action(cx); }).child(text);
   }
 
@@ -111,6 +122,7 @@ export default class CodexAccounts extends View {
           if (e.key === "enter" || e.key === "space") { this.openPicker(); cx.stop_propagation(); }
         })
         .child(h_flex().id("codex-account-picker").h(28).px(9).gap(7).items_center().rounded(7)
+          .border_1().border_color(this.handle.is_focused() ? t.accent : t.chrome)
           .hover(s => s.bg(t.hover)).cursor_pointer().text_size(12).text_color(t.foreground)
           .on_click(() => this.openPicker())
           .child(svg("mods/codex-accounts/account.svg").size(14).text_color(t.muted))
@@ -120,23 +132,36 @@ export default class CodexAccounts extends View {
     const note = this.remote() ? "El selector está disponible en este equipo."
       : this.managed() === false ? "Esta pestaña usa una sesión no administrada. Abre Codex desde aquí para usar esta cuenta."
       : "Cuenta para Codex en Herdr.";
+    const actionIds = disabled ? [] : pending ? ["cancel-login"]
+      : active ? ["open-codex", "open-shell"] : ["connect"];
     return v_flex().id("codex-accounts-panel").track_focus(this.handle)
       .on_key_down((e, cx) => {
         if (e.key === "escape") { closeOverlay(props().overlay); cx.stop_propagation(); }
-        if (e.key === "enter" && !disabled && !pending) {
-          if (active) this.launch("launch"); else this.action("enrol", [], cx);
+        if (actionIds.length && ["tab", "left", "right"].includes(e.key)) {
+          const index = actionIds.findIndex(id => this.buttons[id].is_focused());
+          const backwards = e.key === "left" || (e.key === "tab" && e.modifiers.shift);
+          const next = index < 0 ? (backwards ? actionIds.length - 1 : 0)
+            : (index + (backwards ? -1 : 1) + actionIds.length) % actionIds.length;
+          this.buttons[actionIds[next]].focus();
+          cx.notify();
           cx.stop_propagation();
         }
-      }).size_full().p(18).gap(14).bg(t.popover).text_color(t.foreground)
+        if ((e.key === "enter" || e.key === "space") && !disabled && this.handle.is_focused()) {
+          if (pending) this.action("cancel", [this.state.login.id], cx);
+          else if (active) this.launch("launch");
+          else this.action("enrol", [], cx);
+          cx.stop_propagation();
+        }
+      }).w(410).h(330).p(18).gap(14).bg(t.popover).text_color(t.foreground)
       .child(h_flex().items_center().gap(10)
         .child(svg("mods/codex-accounts/account.svg").size(19).text_color(t.accent))
         .child(div().flex_1().text_size(16).font_semibold().child("Cuenta de Codex"))
         .child(div().text_size(11).text_color(t.muted).child("Esc para cerrar")))
-      .child(v_flex().flex_1().min_h(0).gap(14).overflow_y_scrollbar()
+      .child(v_flex().h(190).flex_shrink_0().gap(14).overflow_y_scrollbar()
       .child(div().text_size(12.5).text_color(t.muted).child(note))
       .when(Boolean(unavailable), el => el.child(v_flex().gap(5)
         .child(div().text_size(14).font_medium().child("Codex no está disponible"))
-        .child(div().text_size(12.5).text_color(t.muted).child("Instala Codex y vuelve a intentarlo. Tu Cuenta guardada se conserva."))))
+        .child(div().text_size(12.5).text_color(t.muted).child("Instala Codex y vuelve a intentarlo. Tu cuenta guardada se conserva."))))
       .when(Boolean(active), el => el.child(v_flex().gap(5).py(10)
         .child(h_flex().gap(8).items_center()
           .child(div().size(6).rounded(3).bg(t.done))
