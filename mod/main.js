@@ -10,11 +10,12 @@ export default class CodexAccounts extends View {
     this.error = null;
     this.handle = cx.focus_handle();
     if (props()?.picker) this.handle.focus();
-    if (!props()?.picker) cx.spawn(async (cx) => {
+    cx.spawn(async (cx) => {
       for (;;) {
         const command = await nextCommand();
-        if (command === "open") this.openPicker();
-        if (command === "connect" && !this.remote()) this.action("enrol", [], cx);
+        if (command === "focus") this.handle.focus();
+        if (command === "open" && !props()?.picker) this.openPicker();
+        if (command === "connect" && !props()?.picker && !this.remote()) this.action("enrol", [], cx);
       }
     });
     cx.spawn(async (cx) => {
@@ -104,8 +105,11 @@ export default class CodexAccounts extends View {
     const unavailable = this.state && !this.state.available;
     const disabled = this.busy || !this.config || !this.state || unavailable || this.remote();
     if (!props()?.picker) {
-      const label = this.error ? "Revisar cuenta" : pending ? "Iniciando sesión" : active?.label ?? "Conectar cuenta";
-      return h_flex().size_full().px(8).items_center().justify_end().bg(t.chrome)
+      const label = this.error ? "Revisar cuenta" : unavailable ? "No disponible" : pending ? "Iniciando sesión" : active?.label ?? "Conectar cuenta";
+      return h_flex().track_focus(this.handle).size_full().px(8).items_center().justify_end().bg(t.chrome)
+        .on_key_down((e, cx) => {
+          if (e.key === "enter" || e.key === "space") { this.openPicker(); cx.stop_propagation(); }
+        })
         .child(h_flex().id("codex-account-picker").h(28).px(9).gap(7).items_center().rounded(7)
           .hover(s => s.bg(t.hover)).cursor_pointer().text_size(12).text_color(t.foreground)
           .on_click(() => this.openPicker())
@@ -128,22 +132,24 @@ export default class CodexAccounts extends View {
         .child(svg("mods/codex-accounts/account.svg").size(19).text_color(t.accent))
         .child(div().flex_1().text_size(16).font_semibold().child("Cuenta de Codex"))
         .child(div().text_size(11).text_color(t.muted).child("Esc para cerrar")))
+      .child(v_flex().flex_1().min_h(0).gap(14).overflow_y_scrollbar()
       .child(div().text_size(12.5).text_color(t.muted).child(note))
+      .when(Boolean(unavailable), el => el.child(v_flex().gap(5)
+        .child(div().text_size(14).font_medium().child("Codex no está disponible"))
+        .child(div().text_size(12.5).text_color(t.muted).child("Instala Codex y vuelve a intentarlo. Tu Cuenta guardada se conserva."))))
       .when(Boolean(active), el => el.child(v_flex().gap(5).py(10)
         .child(h_flex().gap(8).items_center()
           .child(div().size(6).rounded(3).bg(t.done))
-          .child(div().text_size(14).font_medium().child(active.label)))
-        .child(div().text_size(12).text_color(t.muted).child(active.email ?? "Cuenta conectada"))))
-      .when(!active && !pending, el => el.child(v_flex().gap(5).py(8)
-        .child(div().text_size(14).font_medium().child(unavailable ? "Codex no está disponible" : "Conecta tu cuenta de ChatGPT"))
-        .child(div().text_size(12.5).text_color(t.muted).child(unavailable
-          ? "Instala Codex y vuelve a intentarlo." : "El inicio de sesión se abrirá en tu navegador."))))
+          .child(div().text_size(14).font_medium().truncate().child(active.label)))
+        .child(div().text_size(12).text_color(t.muted).truncate().child(active.email ?? "Cuenta conectada"))))
+      .when(!active && !pending && !unavailable, el => el.child(v_flex().gap(5).py(8)
+        .child(div().text_size(14).font_medium().child("Conecta tu cuenta de ChatGPT"))
+        .child(div().text_size(12.5).text_color(t.muted).child("El inicio de sesión se abrirá en tu navegador."))))
       .when(Boolean(pending), el => el.child(v_flex().gap(6).py(10)
         .child(div().text_size(14).font_medium().child("Completa el inicio de sesión"))
         .child(div().text_size(12.5).text_color(t.muted).child("Continúa en el navegador. Esta ventana se actualizará al terminar."))))
       .when(Boolean(this.error || this.state?.login?.error), el => el.child(div().text_size(12).text_color(t.blocked)
-        .child(this.error ?? this.state.login.error)))
-      .child(div().flex_1())
+        .child(this.error ?? this.state.login.error))))
       .child(h_flex().gap(8)
         .when(!active && !pending, el => el.child(this.button("connect", "Conectar cuenta", true, disabled, cx => this.action("enrol", [], cx))))
         .when(Boolean(pending), el => el.child(this.button("cancel-login", "Cancelar inicio de sesión", false, disabled, cx => this.action("cancel", [this.state.login.id], cx))))

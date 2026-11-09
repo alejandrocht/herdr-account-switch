@@ -62,6 +62,25 @@ class AccountFlow(unittest.TestCase):
         self.assertNotIn("FIXTURE_SECRET", result.stdout + result.stderr)
         return json.loads(result.stdout)
 
+    def running_login(self):
+        pending = self.call("enrol")
+        env = dict(self.env, HERDR_TEST_LOGIN="wait")
+        worker = subprocess.Popen(self.command("login", pending["login_id"]),
+                                  env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                  text=True, start_new_session=True)
+        def clean_worker():
+            try:
+                os.killpg(worker.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            worker.communicate(timeout=5)
+        self.addCleanup(clean_worker)
+        deadline = time.monotonic() + 5
+        while self.call("status")["login"].get("state") != "running":
+            self.assertLess(time.monotonic(), deadline)
+            time.sleep(0.02)
+        return pending, worker
+
     def test_empty_selector_identifies_codex_without_reading_an_external_login(self):
         outside = self.root / "outside"
         outside.mkdir()
@@ -85,25 +104,26 @@ class AccountFlow(unittest.TestCase):
         self.assertEqual(self.managed.stat().st_mode & 0o777, 0o700)
 
     def test_cancelled_login_does_not_register_an_account(self):
-        pending = self.call("enrol")
-        self.env["HERDR_TEST_LOGIN"] = "wait"
-        worker = subprocess.Popen(self.command("login", pending["login_id"]),
-                                  env=self.env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                  text=True, start_new_session=True)
-        def clean_worker():
-            if worker.poll() is None:
-                os.killpg(worker.pid, signal.SIGTERM)
-            worker.communicate(timeout=5)
-        self.addCleanup(clean_worker)
-        deadline = time.monotonic() + 5
-        while self.call("status")["login"].get("state") != "running":
-            self.assertLess(time.monotonic(), deadline)
-            time.sleep(0.02)
+        pending, worker = self.running_login()
         self.call("cancel", pending["login_id"])
         worker.communicate(timeout=5)
         state = self.call("status")
         self.assertEqual(state["profiles"], [])
         self.assertEqual(state["login"]["state"], "cancelled")
+
+    def test_interrupting_login_allows_a_fresh_attempt(self):
+        pending, worker = self.running_login()
+        os.killpg(worker.pid, signal.SIGINT)
+        worker.communicate(timeout=5)
+        self.assertNotEqual(self.call("status")["state"], "enrolling")
+        self.assertNotEqual(self.call("enrol")["login_id"], pending["login_id"])
+
+    def test_an_orphaned_login_can_be_retried(self):
+        pending, worker = self.running_login()
+        os.killpg(worker.pid, signal.SIGKILL)
+        worker.communicate(timeout=5)
+        self.assertEqual(self.call("status")["login"]["state"], "failed")
+        self.assertNotEqual(self.call("enrol")["login_id"], pending["login_id"])
 
     def test_launch_uses_only_the_registered_herdr_identity(self):
         pending = self.call("enrol")
@@ -122,6 +142,14 @@ class AccountFlow(unittest.TestCase):
         rejected = self.call("launch", "--", "logout", ok=False)
         self.assertIn("selector", rejected["error"])
         self.assertEqual(self.call("status")["active"]["label"], "demo")
+
+    def test_attached_configuration_cannot_override_managed_authentication(self):
+        pending = self.call("enrol")
+        self.call("login", pending["login_id"])
+        for argument in ('--config=cli_auth_credentials_store="keyring"',
+                         '-cforced_login_method="api"'):
+            with self.subTest(argument=argument):
+                self.call("launch", "--", argument, ok=False)
 
     def test_normal_codex_command_inside_a_managed_terminal_stays_isolated(self):
         pending = self.call("enrol")

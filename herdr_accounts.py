@@ -9,6 +9,7 @@ import os
 from pathlib import Path
 import shutil
 import shlex
+import signal
 import subprocess
 import sys
 import time
@@ -17,6 +18,10 @@ import uuid
 
 class AccountError(Exception):
     pass
+
+
+AUTH_OPTIONS = ["-c", 'cli_auth_credentials_store="file"',
+                "-c", 'forced_login_method="chatgpt"']
 
 
 class Accounts:
@@ -74,7 +79,28 @@ class Accounts:
         os.replace(temp, path)
 
     def job(self):
-        return json.loads(self.job_file.read_text()) if self.job_file.exists() else {}
+        job = json.loads(self.job_file.read_text()) if self.job_file.exists() else {}
+        if job.get("state") == "running" and job.get("worker_pid") not in (None, os.getpid()):
+            if self.process_stamp(job["worker_pid"]) != job.get("worker_stamp"):
+                job.update(state="failed", error="El registro se interrumpió. Vuelve a conectar la Cuenta.")
+        return job
+
+    @staticmethod
+    def process_stamp(pid):
+        result = subprocess.run(["/bin/ps", "-p", str(pid), "-o", "lstart="],
+                                capture_output=True, text=True, timeout=3,
+                                env=dict(os.environ, LC_ALL="C"))
+        return result.stdout.strip() if result.returncode == 0 else None
+
+    @staticmethod
+    def stop_process(process):
+        if process and process.poll() is None:
+            process.terminate()
+            try:
+                process.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
 
     def status(self):
         store = self.store()
@@ -110,29 +136,36 @@ class Accounts:
             if job.get("id") != login_id or job.get("state") != "pending":
                 raise AccountError("Este registro ya terminó o fue cancelado.")
             job["state"] = "running"
+            job.update(worker_pid=os.getpid(), worker_stamp=self.process_stamp(os.getpid()))
             self.write(self.job_file, job)
         stage = self.root / "enrol" / login_id
         env = self.environment(stage)
         process = None
+        interrupted = False
+        def interrupt(_signum, _frame):
+            nonlocal interrupted
+            interrupted = True
+        previous_handlers = {sig: signal.signal(sig, interrupt)
+                             for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)}
         try:
-            options = [self.binary, "-c", 'cli_auth_credentials_store="file"',
-                       "-c", 'forced_login_method="chatgpt"']
+            options = [self.binary, *AUTH_OPTIONS]
             process = subprocess.Popen([*options, "login"], env=env)
             while process.poll() is None:
-                if self.job().get("id") != login_id or self.job().get("state") == "cancelled":
-                    process.terminate()
-                    try:
-                        process.wait(timeout=3)
-                    except subprocess.TimeoutExpired:
-                        process.kill()
-                        process.wait()
+                if interrupted or self.job().get("id") != login_id or self.job().get("state") == "cancelled":
+                    self.cancel(login_id)
+                    self.stop_process(process)
                     return self.status()
                 time.sleep(0.15)
+            if interrupted:
+                return self.cancel(login_id)
             verified = process.returncode == 0 and subprocess.run(
                 [*options, "login", "status"], env=env, capture_output=True, timeout=15).returncode == 0
             with self.locked():
                 job = self.job()
-                if job.get("id") != login_id or job.get("state") == "cancelled":
+                if interrupted or job.get("id") != login_id or job.get("state") == "cancelled":
+                    if interrupted and job.get("id") == login_id:
+                        job["state"] = "cancelled"
+                        self.write(self.job_file, job)
                     return self.status()
                 if not verified:
                     raise AccountError("El inicio de sesión no se completó. Puedes volver a intentarlo.")
@@ -151,9 +184,9 @@ class Accounts:
                                "error": "No se pudo registrar la Cuenta. Vuelve a iniciar sesión."})
             raise AccountError("No se pudo registrar la Cuenta. Vuelve a iniciar sesión.")
         finally:
-            if process and process.poll() is None:
-                process.terminate()
-                process.wait()
+            self.stop_process(process)
+            for sig, handler in previous_handlers.items():
+                signal.signal(sig, handler)
             shutil.rmtree(stage, ignore_errors=True)
 
     def cancel(self, login_id):
@@ -175,14 +208,19 @@ class Accounts:
     def launch(self, arguments):
         protected = ("cli_auth_credentials_store", "forced_login_method", "model_provider",
                      "model_providers", "chatgpt_base_url", "openai_base_url")
-        if any(a in ("login", "logout") or a.startswith("--remote") or
-               a.split("=", 1)[0].startswith(protected) for a in arguments):
-            raise AccountError("Gestiona el inicio de sesión desde el selector de Herdr.")
+        for argument in arguments:
+            setting = argument
+            if setting.startswith("--config="):
+                setting = setting[len("--config="):]
+            elif setting.startswith("-c"):
+                setting = setting[2:].lstrip("=")
+            key = setting.split("=", 1)[0].split(".", 1)[0].strip().strip("\"'")
+            if argument in ("login", "logout") or argument.startswith("--remote") or key in protected:
+                raise AccountError("Gestiona el inicio de sesión desde el selector de Herdr.")
         if not self.status()["active"]:
             raise AccountError("Registra primero tu Cuenta desde el selector de Herdr.")
         self.mark_terminal()
-        os.execvpe(self.binary, [self.binary, "--no-daemon", "-c", 'cli_auth_credentials_store="file"',
-                   "-c", 'forced_login_method="chatgpt"', *arguments], self.environment())
+        os.execvpe(self.binary, [self.binary, "--no-daemon", *AUTH_OPTIONS, *arguments], self.environment())
 
     def shell(self, arguments):
         if not self.binary:
