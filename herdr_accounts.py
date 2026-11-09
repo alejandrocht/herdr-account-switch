@@ -14,14 +14,11 @@ import subprocess
 import sys
 import time
 import uuid
+from codex_runtime import AUTH_OPTIONS, NativeError, NativeServer
 
 
 class AccountError(Exception):
     pass
-
-
-AUTH_OPTIONS = ["-c", 'cli_auth_credentials_store="file"',
-                "-c", 'forced_login_method="chatgpt"']
 
 
 class Accounts:
@@ -33,7 +30,7 @@ class Accounts:
         self.codex_home = self.root / "codex"
         self.job_file = self.root / "login.json"
         self.inherited_group = os.environ.get("HERDR_ACCOUNT_GROUP") == str(self.root)
-        for name in ("codex", "store", "enrol", "bin", "login.json", "lock"):
+        for name in ("codex", "store", "enrol", "verify", "runtimes", "bin", "login.json", "switch.json", "core.json", "lock"):
             if (self.root / name).is_symlink():
                 raise AccountError("El almacenamiento administrado no admite enlaces externos.")
         paths = [p for p in os.get_exec_path() if Path(p).resolve() != self.root / "bin"]
@@ -104,6 +101,8 @@ class Accounts:
                 process.wait()
 
     def status(self):
+        if os.environ.get("HERDR_APP_HOME") == str(self.root.parent) and not (self.root / "core.json").exists():
+            self.remember_core()
         store = self.store()
         profiles = [{"slug": p["slug"], "label": p["label"],
                      "email": p.get("identity", {}).get("email")}
@@ -112,9 +111,12 @@ class Accounts:
         active = next((p for p in profiles if active and p["slug"] == active["slug"]), None)
         job = self.job()
         pending = job.get("state") in ("pending", "running")
+        selection_file = self.root / "switch.json"
+        selection = json.loads(selection_file.read_text()) if selection_file.exists() else {}
         return {"agent": "codex", "available": bool(self.binary and os.access(self.binary, os.X_OK)),
                 "state": "enrolling" if pending else "active" if active else "empty",
                 "profiles": profiles, "active": active,
+                "switch": selection,
                 "login": {k: job[k] for k in ("id", "state", "error", "profile", "duplicate") if k in job}}
 
     def enrol(self):
@@ -205,7 +207,101 @@ class Accounts:
                 self.write(self.job_file, job)
         return self.status()
 
+    def verified_payload(self, _kind, profile):
+        store = self.store()
+        stage = self.root / "verify" / uuid.uuid4().hex
+        self.write(stage / "auth.json", profile["payload"]["auth"])
+        config = self.codex_home / "config.toml"
+        if config.exists():
+            self.write(stage / "config.toml", config.read_text())
+        try:
+            with NativeServer(self.binary, self.environment(stage), cwd=stage) as server:
+                with server.connect() as rpc:
+                    rpc.call("account/rateLimits/read")
+                fresh = {"auth": json.loads((stage / "auth.json").read_text())}
+                server.verify(fresh)
+                return fresh
+        finally:
+            try:
+                fresh = {"auth": json.loads((stage / "auth.json").read_text())}
+                match = store.active_profile("codex", fresh)
+                if match and match["slug"] == profile["slug"]:
+                    profile["payload"] = fresh
+                    store.write_profile(profile)
+            finally:
+                shutil.rmtree(stage, ignore_errors=True)
+
+    def remember_core(self):
+        if os.environ.get("HC_SOCKET"):
+            keys = ("HC_SOCKET", "HC_SESSION", "XDG_CONFIG_HOME", "XDG_STATE_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME")
+            self.write(self.root / "core.json", {key: os.environ[key] for key in keys if key in os.environ})
+
+    def native_terminals(self):
+        path = self.root / "core.json"
+        context = json.loads(path.read_text()) if path.exists() else {}
+        if not context and os.environ.get("HC_SOCKET"):
+            context = {"HC_SOCKET": os.environ["HC_SOCKET"]}
+        if not context:
+            return []
+        env = dict(os.environ, **context)
+        def read(*arguments):
+            result = subprocess.run(["hc", *arguments], env=env, capture_output=True, text=True, timeout=5)
+            if result.returncode:
+                raise AccountError("No se pudo comprobar el estado de las conversaciones de Herdr.")
+            return json.loads(result.stdout)
+        listed = read("ls", "--json")
+        terminals = [read("get", entry["address"]) for entry in listed.get("terminals", [])
+                     if entry.get("state") == "live" or "state" not in entry]
+        return [entry for entry in terminals if entry.get("labels", {}).get("herdr.accounts") == str(self.root)]
+
+    def live_runtimes(self):
+        records = []
+        for path in (self.root / "runtimes").glob("*.json"):
+            record = json.loads(path.read_text())
+            if self.process_stamp(record["pid"]) == record.get("stamp"):
+                records.append(record)
+        return records
+
+    def switch_sessions(self):
+        sessions = self.live_runtimes()
+        known = {session.get("terminal") for session in sessions}
+        for terminal in self.native_terminals():
+            name = terminal.get("foreground", {}).get("name", "").lower()
+            if terminal.get("address") not in known and name not in ("zsh", "bash", "sh", "fish", "nu"):
+                raise AccountError("Esta Conversación usa el lanzador anterior. Debes reanudar el hilo con el nuevo lanzador antes de cambiar de Cuenta.")
+        if len(sessions) > 1:
+            raise AccountError("Esta entrega cambia una Conversación a la vez. La coordinación entre pestañas se añadirá después.")
+        return sessions
+
+    def select(self, key):
+        with self.locked():
+            store = self.store()
+            profile = store.get_profile("codex", key)
+            if not profile:
+                raise AccountError("No existe esa Cuenta guardada.")
+            if self.status()["active"] and self.status()["active"]["slug"] == profile["slug"]:
+                return self.status()
+            self.switch_sessions()
+            job = {"id": uuid.uuid4().hex, "requested": profile["slug"], "phase": "checking",
+                   "identity_verified": False}
+            self.write(self.root / "switch.json", job)
+            previous = store.BACKENDS["codex"].read_live()
+            try:
+                store.switch("codex", profile["slug"], verifier=self.verified_payload)
+                payload = store.BACKENDS["codex"].read_live()
+                with NativeServer(self.binary, self.environment(), cwd=self.root) as server:
+                    server.verify(payload)
+                job.update(phase="prepared", identity_verified=True)
+            except (NativeError, OSError, ValueError, subprocess.SubprocessError, store.SwitchError):
+                if previous:
+                    store.BACKENDS["codex"].write_live(previous)
+                job.update(phase="failed", error="No se pudo verificar la Cuenta. La selección anterior se conserva.")
+            self.write(self.root / "switch.json", job)
+        return self.status()
+
     def mark_terminal(self, active=True):
+        if active:
+            self.remember_core()
         terminal = os.environ.get("HC_TERMINAL_ID")
         if terminal and shutil.which("hc"):
             result = subprocess.run(["hc", "label", terminal,
@@ -272,13 +368,13 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--home", required=True)
     parser.add_argument("--codex")
-    parser.add_argument("command", choices=["status", "enrol", "login", "cancel", "launch", "shell"])
+    parser.add_argument("command", choices=["status", "enrol", "login", "cancel", "select", "launch", "shell"])
     parser.add_argument("arguments", nargs=argparse.REMAINDER)
     args = parser.parse_args()
     try:
         accounts = Accounts(args.home, args.codex)
         arguments = args.arguments[1:] if args.arguments[:1] == ["--"] else args.arguments
-        if args.command in ("login", "cancel"):
+        if args.command in ("login", "cancel", "select"):
             if len(arguments) != 1:
                 raise AccountError("Falta el identificador del registro.")
             result = getattr(accounts, args.command)(arguments[0])

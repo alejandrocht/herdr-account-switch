@@ -786,7 +786,7 @@ def _pinned_warning(kind):
 
 # ---- the switch itself ----------------------------------------------------
 
-def switch(kind, key):
+def switch(kind, key, *, verifier=None):
     """Install a saved profile as the live login. Returns a status string."""
     backend = BACKENDS[kind]
     with _Lock():
@@ -805,7 +805,7 @@ def switch(kind, key):
         # This can rotate the target's tokens, so keep what it hands back: the
         # write below installs it, and the profile is rewritten from it at the
         # end of the switch.
-        target["payload"] = proven_payload(kind, target)
+        target["payload"] = (verifier or proven_payload)(kind, target)
 
         if live is not None:
             # Never overwrite a login we don't have a copy of.

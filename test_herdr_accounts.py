@@ -11,32 +11,7 @@ import unittest
 
 
 CONTROLLER = Path(__file__).with_name("herdr_accounts.py")
-FAKE_CODEX = '''#!/usr/bin/env python3
-import base64, json, os, pathlib, sys, time
-args = sys.argv[1:]
-auth = pathlib.Path(os.environ["CODEX_HOME"]) / "auth.json"
-if "login" in args:
-    if "status" in args:
-        sys.exit(0 if auth.exists() else 1)
-    mode = os.environ.get("HERDR_TEST_LOGIN", "success")
-    if mode == "wait":
-        print("LOGIN_WAITING", flush=True)
-        time.sleep(60)
-    if mode == "fail":
-        print("fake login failed", file=sys.stderr)
-        sys.exit(1)
-    account = os.environ.get("HERDR_TEST_ACCOUNT", "demo")
-    claims = {"email": account + "@example.invalid", "https://api.openai.com/auth": {
-        "chatgpt_account_id": account + "-account", "chatgpt_plan_type": "plus"}}
-    token = "fixture." + base64.urlsafe_b64encode(json.dumps(claims).encode()).decode().rstrip("=") + ".fixture"
-    auth.parent.mkdir(parents=True, exist_ok=True)
-    auth.write_text(json.dumps({"auth_mode": "chatgpt", "tokens": {
-        "id_token": token, "account_id": account + "-account", "access_token": "FIXTURE_SECRET"}}))
-else:
-    print(json.dumps({"args": args, "codex_home": os.environ.get("CODEX_HOME"),
-        "sqlite_home": os.environ.get("CODEX_SQLITE_HOME"),
-        "api_key": os.environ.get("OPENAI_API_KEY"), "group": os.environ.get("HERDR_ACCOUNT_GROUP")}))
-'''
+FAKE_CODEX = (Path(__file__).parent / "tests/fixtures/codex.py").read_text()
 
 
 class AccountFlow(unittest.TestCase):
@@ -49,7 +24,9 @@ class AccountFlow(unittest.TestCase):
         self.binary.write_text(FAKE_CODEX)
         self.binary.chmod(0o700)
         self.env = dict(os.environ, OPENAI_API_KEY="outside-key")
-        self.env.pop("HC_TERMINAL_ID", None)
+        for key in list(self.env):
+            if key.startswith("HC_"):
+                self.env.pop(key)
         self.env.pop("HERDR_ACCOUNT_GROUP", None)
 
     def command(self, *args):
@@ -114,6 +91,36 @@ class AccountFlow(unittest.TestCase):
         state = self.call("status")
         self.assertEqual({p["label"] for p in state["profiles"]}, {"demo", "second"})
         self.assertEqual(state["active"]["label"], "demo")
+
+    def test_a_saved_account_can_be_selected_without_another_browser_login(self):
+        first = self.call("enrol")
+        self.call("login", first["login_id"])
+        self.env["HERDR_TEST_ACCOUNT"] = "second"
+        second = self.call("enrol")
+        self.call("login", second["login_id"])
+        result = self.call("select", "second")
+        self.assertEqual(result["active"]["label"], "second")
+        self.assertEqual(result["switch"]["phase"], "prepared")
+        self.assertTrue(result["switch"]["identity_verified"])
+        self.assertEqual(self.call("status")["active"]["label"], "second")
+
+    def test_switch_refuses_a_legacy_managed_conversation_without_changing_its_account(self):
+        first = self.call("enrol")
+        self.call("login", first["login_id"])
+        self.env["HERDR_TEST_ACCOUNT"] = "second"
+        second = self.call("enrol")
+        self.call("login", second["login_id"])
+        hc = self.root / "hc"
+        hc.write_text("#!/usr/bin/env python3\nimport json, os, sys\n"
+            "value = {'terminals': [{'address': 'legacy'}]} if sys.argv[1] == 'ls' else "
+            "{'labels': {'herdr.accounts': os.environ['HERDR_ACCOUNT_GROUP']}, "
+            "'foreground': {'name': 'Python'}}\nprint(json.dumps(value))\n")
+        hc.chmod(0o700)
+        self.env.update(HC_SOCKET=str(self.root / "fake-core.sock"),
+                        PATH=str(self.root) + os.pathsep + self.env["PATH"])
+        rejected = self.call("select", "second", ok=False)
+        self.assertIn("reanudar", rejected["error"].lower())
+        self.assertEqual(self.call("status")["active"]["label"], "demo")
 
     def test_cancelled_login_does_not_register_an_account(self):
         pending, worker = self.running_login()
