@@ -12,10 +12,26 @@ import sys
 from herdr_accounts import Accounts, AccountError
 
 
-def environment(app_home, binary=None):
+def preview_home(app_home):
     app = Path(app_home).expanduser().resolve()
     if app in (Path.home(), Path("/"), Path.home() / ".config/herdr-app"):
         raise AccountError("Usa un directorio exclusivo para la ventana de prueba de Herdr.")
+    return app
+
+
+def require_closed_window(app):
+    result = subprocess.run(["herdr-app", "status"],
+        env=dict(os.environ, HERDR_APP_HOME=str(app), LC_ALL="C"),
+        capture_output=True, text=True, timeout=5)
+    if result.returncode == 0:
+        raise AccountError("Ya hay una ventana de prueba abierta. Cierra solo esa ventana y vuelve a abrirla con este lanzador; sus sesiones permanecen en el core.")
+    if result.returncode != 2 or not any(reason in result.stderr for reason in (
+            "Connection refused", "No such file or directory")):
+        raise AccountError("No se pudo comprobar la ventana de prueba. No se ha cambiado su entorno.")
+
+
+def environment(app_home, binary=None):
+    app = preview_home(app_home)
     accounts = Accounts(app / "accounts", binary)
     accounts.private_dir(accounts.root)
     env = accounts.shell_environment()
@@ -59,14 +75,16 @@ def main():
     parser.add_argument("--app-home", required=True)
     args = parser.parse_args()
     try:
-        env = environment(args.app_home)
+        app = preview_home(args.app_home)
+        require_closed_window(app)
+        env = environment(app)
         # Always refresh the recorded core context: a previous preview may have
         # used another private core. This never stops or changes its sessions.
         accounts = Accounts(Path(env["CODEX_HOME"]).parent)
         accounts.write(accounts.root / "core.json",
             {k: v for k, v in env.items() if k in ("HC_SOCKET", "HC_SESSION") or k.startswith("XDG_")})
         return subprocess.call(["herdr-app"], env=env)
-    except (AccountError, OSError) as error:
+    except (AccountError, OSError, subprocess.TimeoutExpired) as error:
         print(str(error), file=sys.stderr)
         return 1
 

@@ -14,6 +14,39 @@ from unittest.mock import patch
 from preview import environment
 
 
+class PreviewLauncher(unittest.TestCase):
+    def test_an_existing_window_cannot_be_mistaken_for_a_reconfigured_preview(self):
+        with tempfile.TemporaryDirectory(prefix="herdr-preview-launcher-") as folder:
+            root = Path(folder).resolve()
+            app = root / "app"
+            accounts = app / "accounts"
+            accounts.mkdir(parents=True)
+            context = accounts / "core.json"
+            context.write_text('{"HC_SESSION":"previous-core"}')
+            client = root / "herdr-app"
+            unexpected = root / "unexpected-open"
+            client.write_text("#!/usr/bin/env python3\nimport os,sys\nfrom pathlib import Path\n"
+                "if sys.argv[1:] == ['status']:\n    print('{}')\n"
+                "    print('Permission denied',file=sys.stderr)\n    sys.exit(int(os.environ['HERDR_TEST_STATUS']))\n"
+                "else:\n    Path(" + repr(str(unexpected)) + ").write_text('raised-old-window')\n")
+            client.chmod(0o700)
+            fake = root / "codex"
+            fake.write_text("#!/bin/sh\nexit 1\n")
+            fake.chmod(0o700)
+            env = dict(os.environ, PATH=str(root) + os.pathsep + os.environ["PATH"],
+                       HERDR_ACCOUNTS_CODEX_BINARY=str(fake))
+            for status in ("0", "2"):
+                with self.subTest(status=status):
+                    result = subprocess.run([sys.executable, str(Path(__file__).with_name("preview.py")),
+                        "--app-home", str(app)], env=dict(env, HERDR_TEST_STATUS=status),
+                        capture_output=True, text=True, timeout=10)
+                    self.assertEqual(result.returncode, 1, "must refuse to reuse an unverified running window")
+                    self.assertEqual(context.read_text(), '{"HC_SESSION":"previous-core"}')
+                    self.assertFalse(unexpected.exists())
+                    self.assertFalse((app / "runtime").exists())
+                    self.assertIn("ventana", result.stderr.lower())
+
+
 @unittest.skipUnless(shutil.which("hc") and Path("/bin/zsh").exists(), "Herdr native core required")
 class PreviewIsolation(unittest.TestCase):
     def setUp(self):

@@ -27,6 +27,18 @@ class AccountFlow(unittest.TestCase):
         self.binary.write_text(FAKE_CODEX)
         self.binary.chmod(0o700)
         self.env = dict(os.environ, OPENAI_API_KEY="outside-key")
+        self.external = self.root / "external-controls"
+        for name in ("codex/auth.json", "codex/config.toml", "sqlite/control.db", "store/control.txt"):
+            path = self.external / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("EXTERNAL_CONTROL_" + name)
+        self.external_snapshot = {str(p.relative_to(self.external)): p.read_bytes()
+                                  for p in self.external.rglob("*") if p.is_file()}
+        self.env.update(CODEX_HOME=str(self.external / "codex"),
+                        CODEX_SQLITE_HOME=str(self.external / "sqlite"),
+                        HERDR_PLUGIN_STATE_DIR=str(self.external / "store"),
+                        HERDR_PLUGIN_CONFIG_DIR=str(self.external / "store"))
+        self.addCleanup(self.assert_external_unchanged)
         for key in list(self.env):
             if key.startswith("HC_"):
                 self.env.pop(key)
@@ -38,6 +50,11 @@ class AccountFlow(unittest.TestCase):
     def command(self, *args):
         return [sys.executable, str(CONTROLLER), "--home", str(self.managed),
                 "--codex", str(self.binary), *args]
+
+    def assert_external_unchanged(self):
+        actual = {str(p.relative_to(self.external)): p.read_bytes()
+                  for p in self.external.rglob("*") if p.is_file()}
+        self.assertTrue(actual == self.external_snapshot, "External authentication/configuration controls changed")
 
     @unittest.skipUnless(shutil.which("node") and Path("/bin/zsh").exists(), "native mod launch harness")
     def test_account_button_never_leaves_a_shell_with_the_external_login(self):
@@ -76,6 +93,7 @@ class AccountFlow(unittest.TestCase):
                                 capture_output=True, text=True, timeout=10)
         self.assertEqual(result.returncode, 0 if ok else 1, result.stderr)
         self.assertNotIn("FIXTURE_SECRET", result.stdout + result.stderr)
+        self.assert_external_unchanged()
         return json.loads(result.stdout)
 
     def running_login(self):

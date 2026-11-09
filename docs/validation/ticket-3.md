@@ -7,8 +7,10 @@ after the user's isolation regression report; see its validation document.
 
 ## Automated evidence
 
-- `python3 -m unittest -q test_herdr_accounts test_preview`: 25 tests passed.
+- `python3 -m unittest -q test_herdr_accounts test_preview`: 26 tests passed.
   Temporary credentials only; no real browser login or global credential writes.
+  Every public controller operation and test cleanup now compares external auth,
+  configuration, SQLite and profile-store controls, including cycles/rollback.
 - `python3 test_switcher.py`: original checks passed, zero failures.
 - Python compilation and the source native mod check passed.
 - A native preview with three fictitious profiles rendered the saved-account
@@ -34,7 +36,35 @@ credentials and a local Responses fixture: a completed native thread resumed
 after a server restart with its original ID and context. This protocol check
 does not prove that two actual accounts can use that thread.
 
+## Independent reviews
+
+Standards: zero documented-standard violations. One optional low-priority
+duplication smell remains in the successful/rollback resume paths; no defect
+was demonstrated, and those paths remain covered by focused failure tests.
+
+Spec: two findings (existing-window reuse and missing external controls during
+the switch cycle) were corrected and rechecked. Zero remaining findings in the
+correction; real two-account acceptance remains pending.
+
+Visual: the fresh populated three-profile capture was approved without visual
+blockers. Source includes persistent focus handles and keyboard navigation.
+Native keyboard input and the empty/pending/failure captures were not separately
+exercised in that visual review and are not claimed as such.
+
+The corrected user preview was then opened through the guarded launcher. Its
+existing first profile remained saved. A fresh workspace's native metadata
+confirmed the private controller shell and live ownership, with no window
+errors. The installed mod passed native check and its one-profile capture was
+inspected locally. No new real login, account switch or model request was made.
+
 ## Limits and remaining acceptance
+
+Spec review identified reuse of an already open preview as an isolation gap:
+bare Herdr only raises it, so changing controller metadata cannot change that
+window's environment. A public-launcher regression reproduced this before the
+fix. The launcher now checks first and refuses to reuse an existing window,
+without changing its core context or starting another client. Its sessions are
+preserved; only that preview window needs closing before relaunch.
 
 - Start the corrected window with `preview.py` or `open-preview.command`.
   HERDR_APP_HOME alone is insufficient. Earlier cores and their sessions remain

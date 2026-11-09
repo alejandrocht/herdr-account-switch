@@ -17,6 +17,9 @@ python3 preview.py --app-home /path/to/preview
 
 Use `preview.py` or the generated `open-preview.command` to open the preview.
 Setting HERDR_APP_HOME alone does not establish the complete isolation boundary.
+If that preview window is already open, the launcher refuses to reuse it:
+close only that window and relaunch; its core sessions stay running. Raising an
+older window cannot apply a new environment or prove its core context.
 The launcher configures a separate core, shell and recovery shell inside the
 preview, private Codex command resolution, and private macOS shell startup files.
 It never stops the usual Herdr core or changes its settings. Sessions in any
