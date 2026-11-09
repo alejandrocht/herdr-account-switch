@@ -25,12 +25,13 @@ if "login" in args:
     if mode == "fail":
         print("fake login failed", file=sys.stderr)
         sys.exit(1)
-    claims = {"email": "demo@example.invalid", "https://api.openai.com/auth": {
-        "chatgpt_account_id": "demo-account", "chatgpt_plan_type": "plus"}}
+    account = os.environ.get("HERDR_TEST_ACCOUNT", "demo")
+    claims = {"email": account + "@example.invalid", "https://api.openai.com/auth": {
+        "chatgpt_account_id": account + "-account", "chatgpt_plan_type": "plus"}}
     token = "fixture." + base64.urlsafe_b64encode(json.dumps(claims).encode()).decode().rstrip("=") + ".fixture"
     auth.parent.mkdir(parents=True, exist_ok=True)
     auth.write_text(json.dumps({"auth_mode": "chatgpt", "tokens": {
-        "id_token": token, "account_id": "demo-account", "access_token": "FIXTURE_SECRET"}}))
+        "id_token": token, "account_id": account + "-account", "access_token": "FIXTURE_SECRET"}}))
 else:
     print(json.dumps({"args": args, "codex_home": os.environ.get("CODEX_HOME"),
         "sqlite_home": os.environ.get("CODEX_SQLITE_HOME"),
@@ -102,6 +103,17 @@ class AccountFlow(unittest.TestCase):
         self.assertEqual(state["active"]["label"], "demo")
         self.assertEqual(len(state["profiles"]), 1)
         self.assertEqual(self.managed.stat().st_mode & 0o777, 0o700)
+
+    def test_registering_a_second_account_preserves_the_active_account(self):
+        first = self.call("enrol")
+        self.call("login", first["login_id"])
+        self.env["HERDR_TEST_ACCOUNT"] = "second"
+        second = self.call("enrol")
+        self.assertNotEqual(second["login_id"], first["login_id"])
+        self.call("login", second["login_id"])
+        state = self.call("status")
+        self.assertEqual({p["label"] for p in state["profiles"]}, {"demo", "second"})
+        self.assertEqual(state["active"]["label"], "demo")
 
     def test_cancelled_login_does_not_register_an_account(self):
         pending, worker = self.running_login()

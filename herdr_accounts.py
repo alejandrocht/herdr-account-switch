@@ -115,14 +115,12 @@ class Accounts:
         return {"agent": "codex", "available": bool(self.binary and os.access(self.binary, os.X_OK)),
                 "state": "enrolling" if pending else "active" if active else "empty",
                 "profiles": profiles, "active": active,
-                "login": {k: job[k] for k in ("id", "state", "error") if k in job}}
+                "login": {k: job[k] for k in ("id", "state", "error", "profile", "duplicate") if k in job}}
 
     def enrol(self):
         if not self.binary or not os.access(self.binary, os.X_OK):
             raise AccountError("Codex no está disponible en este equipo.")
         with self.locked():
-            if self.status()["active"]:
-                return self.status()
             job = self.job()
             if job.get("state") not in ("pending", "running"):
                 job = {"id": uuid.uuid4().hex, "state": "pending"}
@@ -172,11 +170,20 @@ class Accounts:
                     raise AccountError("El inicio de sesión no se completó. Puedes volver a intentarlo.")
                 auth = json.loads((stage / "auth.json").read_text())
                 store = self.store()
-                if not store.BACKENDS["codex"].identity({"auth": auth}).get("account_id"):
+                payload = {"auth": auth}
+                backend = store.BACKENDS["codex"]
+                identity = backend.identity(payload)
+                if not identity.get("account_id"):
                     raise AccountError("Codex no confirmó la identidad de la Cuenta.")
-                self.write(self.codex_home / "auth.json", auth)
-                store.save_live("codex")
-                self.write(self.job_file, {"id": login_id, "state": "completed"})
+                profile = store.active_profile("codex", payload)
+                duplicate = profile is not None
+                if not profile:
+                    profile = store.make_profile("codex", store.default_label("codex", identity), payload)
+                    store.write_profile(profile)
+                if backend.read_live() is None:
+                    self.write(self.codex_home / "auth.json", profile["payload"]["auth"])
+                self.write(self.job_file, {"id": login_id, "state": "completed",
+                                          "profile": profile["slug"], "duplicate": duplicate})
             return self.status()
         except (OSError, ValueError, subprocess.SubprocessError, AccountError):
             with self.locked():
