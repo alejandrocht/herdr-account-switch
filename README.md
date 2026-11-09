@@ -1,5 +1,9 @@
 # account-switch
 
+This fork also develops a native **Herdr App** integration. See
+[Herdr App setup and validation](docs/herdr-app.md). The instructions below
+describe the original Herdr TUI plugin.
+
 Hot-swap Claude Code / Codex logins from inside [herdr](https://herdr.dev),
 without logging out and back in. For the case: your main account hits its
 window at 11am, you have a second one, and you don't want to re-auth in a
