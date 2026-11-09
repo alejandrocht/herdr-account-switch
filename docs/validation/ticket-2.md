@@ -65,6 +65,10 @@ account and keyboard validation above remains pending.
   command exited successfully. No model tools or project changes were requested.
 - The connected selector was inspected in a fresh native frame: identity and
   both launch actions were visible. The image remains local and is not published.
+- The user independently confirmed the first account's identity and then opened
+  interactive Codex through **Abrir Codex**. Public native metadata confirmed the
+  selected Codex pane was launched by the account controller and carried the
+  private managed-account label. No input was sent to that conversation.
 - Native Herdr keeps a normal shell after an explicit command finishes. The live
   check revealed that our account label previously survived that transition.
   The controller now supervises its managed process and releases its own label
