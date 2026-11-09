@@ -117,7 +117,8 @@ export default class CodexAccounts extends View {
     const disabled = this.busy || !this.config || !this.state || unavailable || this.remote();
     if (!props()?.picker) {
       const label = this.error ? "Revisar cuenta" : unavailable ? "No disponible" : pending ? "Iniciando sesión" : active?.label ?? "Conectar cuenta";
-      return h_flex().track_focus(this.handle).size_full().px(8).items_center().justify_end().bg(t.chrome)
+      return h_flex().track_focus(this.handle).size_full().px(8).items_center().justify_end()
+        .bg(t.chrome).border_b(1).border_color(t.border)
         .on_key_down((e, cx) => {
           if (e.key === "enter" || e.key === "space") { this.openPicker(); cx.stop_propagation(); }
         })

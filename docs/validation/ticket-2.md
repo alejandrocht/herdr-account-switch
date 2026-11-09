@@ -43,3 +43,12 @@ The pending official login was cancelled; no real account was registered.
 
 Do not claim multi-account switching or conversation continuity from this ticket.
 Those are #3. Persistent installation in the normal Herdr App is deferred to #7.
+
+## Divider follow-up
+
+The user reported that the tab-bar divider stopped at the account button. A live
+frame reproduced the gap. The selector now draws the same one-pixel bottom
+border and theme color as the shipped tabs mod. Source and installed-mod native
+checks passed. A fresh frame confirmed matching border pixels on both sides of
+the join. This check covers the reported divider defect only; the outstanding
+account and keyboard validation above remains pending.
