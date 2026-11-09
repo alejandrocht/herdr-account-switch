@@ -76,3 +76,21 @@ account and keyboard validation above remains pending.
 This establishes initial registration and authenticated requests for the first
 account. It does not establish cross-account conversation continuity or prove
 keyboard interactions that have not yet been exercised.
+
+## Standards
+
+The independent review of `1a0014e...2509af6` found no documented-standard
+violations or material baseline smells. Process supervision and label ownership
+remain together and reuse the existing child cleanup. The reviewer independently
+reran all ten temporary-fixture tests successfully without accessing real accounts.
+
+## Spec
+
+The independent review found no new code defects or scope creep in the lifecycle
+fix. Managed labels now end with their owning process; nested Codex retains its
+managed shell's label. Real registration and both authenticated launch paths are
+demonstrated. Final keyboard interaction evidence is still pending and has been
+requested from the user, so #2 remains open.
+
+Review totals: Standards zero findings; Spec zero new code findings and one
+remaining validation gap (native keyboard interaction).
