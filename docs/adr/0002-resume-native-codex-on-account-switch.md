@@ -8,6 +8,16 @@ Una prueba local con esa versión, credenciales ficticias, proveedor local y un
 CODEX_HOME temporal confirmó: iniciar A carga A; escribir B mantiene A en el
 Agente; reiniciar el servidor carga B. No se utilizaron credenciales reales.
 
+La misma prueba creó un hilo mediante `thread/start`, completó un turno contra un
+proveedor Responses local simulado, reinició con B y llamó `thread/resume` con el
+mismo identificador. El segundo turno terminó y su entrada al modelo conservó el
+marcador del primer turno. Esto verifica el protocolo de la versión instalada,
+sin sustituir la demostración obligatoria con dos Cuentas reales.
+
+Una conversación sin primer turno todavía no tiene un rollout que Codex pueda
+reanudar: el servidor responde «no rollout found». En ese estado se conserva A y
+se pide guardar el primer turno o cerrar la sesión vacía antes de preparar B.
+
 Usaremos un app-server hijo propio por Conversación administrada y la TUI nativa
 conectada a su socket Unix privado. El protocolo del socket es WebSocket; el
 adaptador usa biblioteca estándar y no abre un puerto de red. Los directorios

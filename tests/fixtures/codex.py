@@ -6,10 +6,12 @@ import json
 import os
 from pathlib import Path
 import socketserver
+import socket
 import struct
 import sys
 import threading
 import time
+import uuid
 
 
 args = sys.argv[1:]
@@ -46,7 +48,41 @@ def read_frame(stream):
 def serve():
     endpoint = args[args.index("--listen") + 1].removeprefix("unix://")
     cached = json.loads(auth_file.read_text())
+    history_file = auth_file.parent / "fixture_threads.json"
+    threads = json.loads(history_file.read_text()) if history_file.exists() else {}
+    loaded = set()
     lock = threading.Lock()
+    def provider_state():
+        path = os.environ.get("HERDR_TEST_PROVIDER_STATE")
+        return json.loads(Path(path).read_text()) if path else {}
+    def save_provider(state):
+        path = Path(os.environ["HERDR_TEST_PROVIDER_STATE"])
+        stage = path.with_suffix(".native.tmp")
+        stage.write_text(json.dumps(state))
+        stage.replace(path)
+    def turn(params, started):
+        with lock:
+            thread = threads[params["threadId"]]
+            thread["status"] = {"type": "active"}
+        started()
+        while provider_state().get("hold_turns"):
+            time.sleep(0.02)
+        with lock:
+            message = params["input"][0]["text"]
+            number = len(thread["turns"]) + 1
+            items = [{"id": f"user-{number}", "type": "userMessage", "text": message}]
+            if message == "write-once":
+                work = Path(thread["cwd"]) / "work.txt"
+                count = int(work.read_text()) + 1 if work.exists() else 1
+                work.write_text(str(count))
+                items.append({"id": f"tool-{number}", "type": "commandExecution",
+                              "output": "NATIVE_TOOL_RESULT_" + str(count)})
+            items.append({"id": f"answer-{number}", "type": "agentMessage", "text": "DONE"})
+            thread["turns"].append({"id": f"turn-{number}", "items": items, "status": "completed"})
+            thread["status"] = {"type": "idle"}
+            history_file.write_text(json.dumps(threads))
+            return {"event": "turn", "thread_id": thread["id"],
+                    "account": cached["tokens"]["account_id"], "history": thread["turns"]}
     class Handler(socketserver.StreamRequestHandler):
         def handle(self):
             self.rfile.readline()
@@ -74,18 +110,59 @@ def serve():
                 if "id" not in request:
                     continue
                 method = request["method"]
+                params = request.get("params") or {}
                 error = None
+                if method == "turn/start":
+                    result = turn(params, lambda: send_frame(self.wfile,
+                        {"method": "turn/started", "params": {"threadId": params["threadId"]}}))
+                    send_frame(self.wfile, {"id": request["id"], "result": result})
+                    continue
                 with lock:
                     if method == "initialize":
                         result = {"userAgent": "codex/fixture", "codexHome": str(auth_file.parent)}
                     elif method == "getAuthStatus":
-                        result = {"authMethod": "chatgpt", "authToken": cached["tokens"]["access_token"]}
+                        state = provider_state()
+                        if state.get("hold_activation") == cached["tokens"]["account_id"] and state.get("live_home") == str(auth_file.parent):
+                            state.update(activation_waiting=True, activation_pid=os.getpid())
+                            save_provider(state)
+                            while provider_state().get("hold_activation"):
+                                time.sleep(0.02)
+                        if state.get("refresh_live") == cached["tokens"]["account_id"] and state.get("live_home") == str(auth_file.parent) and not cached.get("fixture_rotated"):
+                            state.setdefault("revoked_access", []).append(cached["tokens"]["access_token"])
+                            save_provider(state)
+                            cached["tokens"]["access_token"] += "_rotated"
+                            cached["fixture_rotated"] = True
+                            auth_file.write_text(json.dumps(cached))
+                        stale = state.get("reject_activation") == cached["tokens"]["account_id"] and state.get("live_home") == str(auth_file.parent)
+                        result = {"authMethod": "chatgpt", "authToken": "FIXTURE_STALE" if stale else cached["tokens"]["access_token"]}
                     elif method == "account/rateLimits/read":
-                        state_path = os.environ.get("HERDR_TEST_PROVIDER_STATE")
-                        state = json.loads(Path(state_path).read_text()) if state_path else {}
-                        if cached["tokens"]["account_id"] in state.get("rejected", []):
+                        state = provider_state()
+                        if cached["tokens"]["account_id"] in state.get("rejected", []) or cached["tokens"]["access_token"] in state.get("revoked_access", []):
                             error = {"code": -32000, "message": "Fixture account refused"}
                         result = {"rateLimits": {}}
+                    elif method == "thread/loaded/list":
+                        result = {"data": list(loaded)}
+                    elif method == "thread/start":
+                        thread_id = str(uuid.uuid4())
+                        threads[thread_id] = {"id": thread_id, "status": {"type": "idle"},
+                            "cwd": params.get("cwd"), "turns": []}
+                        loaded.add(thread_id)
+                        history_file.write_text(json.dumps(threads))
+                        result = {"thread": threads[thread_id]}
+                    elif method in ("thread/read", "thread/resume"):
+                        thread_id = params["threadId"]
+                        state = provider_state()
+                        if method == "thread/resume" and state.get("hold_resume") == cached["tokens"]["account_id"]:
+                            state["resume_waiting"] = True
+                            save_provider(state)
+                            while provider_state().get("hold_resume"):
+                                time.sleep(0.02)
+                        if method == "thread/resume" and state.get("reject_resume") == cached["tokens"]["account_id"]:
+                            send_frame(self.wfile, {"id": request["id"], "error": {"code": -32000, "message": "Fixture resume refused"}})
+                            continue
+                        if method == "thread/resume":
+                            loaded.add(thread_id)
+                        result = {"thread": threads[thread_id]}
                     else:
                         error = {"code": -32601, "message": "Fixture method unsupported"}
                         result = None
@@ -96,8 +173,45 @@ def serve():
         server.serve_forever()
 
 
+def tui():
+    endpoint = args[args.index("--remote") + 1].removeprefix("unix://")
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    sock.connect(endpoint)
+    stream = sock.makefile("rwb")
+    key = base64.b64encode(os.urandom(16)).decode()
+    stream.write(("GET / HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
+                  "Sec-WebSocket-Version: 13\r\nSec-WebSocket-Key: " + key + "\r\n\r\n").encode())
+    stream.flush()
+    while stream.readline() != b"\r\n":
+        pass
+    serial = 0
+    def rpc(method, params=None):
+        nonlocal serial
+        serial += 1
+        send_frame(stream, {"id": serial, "method": method, "params": params or {}}, masked=True)
+        while True:
+            reply = read_frame(stream)
+            if reply.get("method") == "turn/started":
+                print(json.dumps({"event": "working"}), flush=True)
+            elif reply.get("id") == serial:
+                return reply["result"]
+    rpc("initialize")
+    if "resume" in args:
+        thread = rpc("thread/resume", {"threadId": args[args.index("resume") + 1]})["thread"]
+    else:
+        thread = rpc("thread/start", {"cwd": os.getcwd()})["thread"]
+    print(json.dumps({"event": "ready", "thread_id": thread["id"], "history": thread["turns"]}), flush=True)
+    for line in sys.stdin:
+        result = rpc("turn/start", {"threadId": thread["id"], "input": [{"type": "text", "text": line.rstrip("\n")}]})
+        print(json.dumps(result), flush=True)
+    stream.close()
+    sock.close()
+
+
 if "app-server" in args:
     serve()
+elif "--remote" in args:
+    tui()
 elif "login" in args:
     if "status" in args:
         sys.exit(0 if auth_file.exists() else 1)

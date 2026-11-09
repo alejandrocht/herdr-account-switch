@@ -14,7 +14,10 @@ import subprocess
 import sys
 import time
 import uuid
-from codex_runtime import AUTH_OPTIONS, NativeError, NativeServer
+from codex_runtime import AUTH_OPTIONS, NativeBusy, NativeError, NativeServer
+
+
+PENDING_SWITCH = ("requested", "waiting", "checking", "resuming")
 
 
 class AccountError(Exception):
@@ -30,7 +33,7 @@ class Accounts:
         self.codex_home = self.root / "codex"
         self.job_file = self.root / "login.json"
         self.inherited_group = os.environ.get("HERDR_ACCOUNT_GROUP") == str(self.root)
-        for name in ("codex", "store", "enrol", "verify", "runtimes", "bin", "login.json", "switch.json", "core.json", "lock"):
+        for name in ("codex", "store", "enrol", "verify", "runtimes", "owners", "bin", "login.json", "switch.json", "core.json", "lock"):
             if (self.root / name).is_symlink():
                 raise AccountError("El almacenamiento administrado no admite enlaces externos.")
         paths = [p for p in os.get_exec_path() if Path(p).resolve() != self.root / "bin"]
@@ -111,18 +114,26 @@ class Accounts:
         active = next((p for p in profiles if active and p["slug"] == active["slug"]), None)
         job = self.job()
         pending = job.get("state") in ("pending", "running")
-        selection_file = self.root / "switch.json"
-        selection = json.loads(selection_file.read_text()) if selection_file.exists() else {}
+        selection = self.selection_job()
+        selected = active
+        if selection.get("phase") in PENDING_SWITCH:
+            active = next((p for p in profiles if p["slug"] == selection.get("previous")), None)
         return {"agent": "codex", "available": bool(self.binary and os.access(self.binary, os.X_OK)),
                 "state": "enrolling" if pending else "active" if active else "empty",
                 "profiles": profiles, "active": active,
+                "selected": selected,
                 "switch": selection,
+                "managed_terminals": [owner["terminal"] for owner in self.live_owners() if owner.get("terminal")],
+                "sessions": [{key: record.get(key) for key in ("id", "terminal", "profile", "phase", "thread_id")}
+                             for record in self.live_runtimes()],
                 "login": {k: job[k] for k in ("id", "state", "error", "profile", "duplicate") if k in job}}
 
     def enrol(self):
         if not self.binary or not os.access(self.binary, os.X_OK):
             raise AccountError("Codex no está disponible en este equipo.")
         with self.locked():
+            if self.selection_job().get("phase") in PENDING_SWITCH:
+                raise AccountError("Espera a que termine el cambio de Cuenta.")
             job = self.job()
             if job.get("state") not in ("pending", "running"):
                 job = {"id": uuid.uuid4().hex, "state": "pending"}
@@ -218,9 +229,7 @@ class Accounts:
             with NativeServer(self.binary, self.environment(stage), cwd=stage) as server:
                 with server.connect() as rpc:
                     rpc.call("account/rateLimits/read")
-                fresh = {"auth": json.loads((stage / "auth.json").read_text())}
-                server.verify(fresh)
-                return fresh
+                return self.verify_loaded(server, profile, stage / "auth.json")
         finally:
             try:
                 fresh = {"auth": json.loads((stage / "auth.json").read_text())}
@@ -230,6 +239,44 @@ class Accounts:
                     store.write_profile(profile)
             finally:
                 shutil.rmtree(stage, ignore_errors=True)
+
+    def verify_loaded(self, server, profile, path=None):
+        for attempt in range(2):
+            payload = {"auth": json.loads((path or self.codex_home / "auth.json").read_text())}
+            match = self.store().active_profile("codex", payload)
+            if not match or match["slug"] != profile["slug"]:
+                raise NativeError("La identidad efectiva no coincide con la Cuenta elegida.")
+            try:
+                server.verify(payload)
+                return payload
+            except NativeError:
+                if attempt:
+                    raise
+
+    def selection_job(self):
+        path = self.root / "switch.json"
+        job = json.loads(path.read_text()) if path.exists() else {}
+        if job.get("phase") in PENDING_SWITCH and job.get("owner_pid") not in (None, os.getpid()):
+            if self.process_stamp(job["owner_pid"]) != job.get("owner_stamp"):
+                job.update(phase="failed", error="La sesión terminó antes de confirmar el cambio. Comprueba la Cuenta antes de continuar.")
+        return job
+
+    def restore_previous(self, payload):
+        store = self.store()
+        if payload:
+            profile = store.active_profile("codex", payload)
+            if profile:
+                # switch() parks the latest target credentials before restoring A.
+                store.switch("codex", profile["slug"], verifier=lambda _kind, _profile: payload)
+            else:
+                store.BACKENDS["codex"].write_live(payload)
+        else:
+            live = store.BACKENDS["codex"].read_live()
+            profile = store.active_profile("codex", live) if live else None
+            if profile:
+                profile["payload"] = live
+                store.write_profile(profile)
+            (self.codex_home / "auth.json").unlink(missing_ok=True)
 
     def remember_core(self):
         if os.environ.get("HC_SOCKET"):
@@ -255,9 +302,18 @@ class Accounts:
         return [entry for entry in terminals if entry.get("labels", {}).get("herdr.accounts") == str(self.root)]
 
     def live_runtimes(self):
+        return self.live_records("runtimes")
+
+    def live_owners(self):
+        return self.live_records("owners")
+
+    def live_records(self, folder):
         records = []
-        for path in (self.root / "runtimes").glob("*.json"):
-            record = json.loads(path.read_text())
+        for path in (self.root / folder).glob("*.json"):
+            try:
+                record = json.loads(path.read_text())
+            except FileNotFoundError:
+                continue  # Its owning process exited between glob and read.
             if self.process_stamp(record["pid"]) == record.get("stamp"):
                 records.append(record)
         return records
@@ -275,29 +331,172 @@ class Accounts:
 
     def select(self, key):
         with self.locked():
+            if self.job().get("state") in ("pending", "running"):
+                raise AccountError("Espera a que termine el registro de la Cuenta.")
             store = self.store()
             profile = store.get_profile("codex", key)
             if not profile:
                 raise AccountError("No existe esa Cuenta guardada.")
+            pending = self.selection_job()
+            if pending.get("phase") in PENDING_SWITCH:
+                if pending.get("requested") == profile["slug"]:
+                    return self.status()
+                raise AccountError("Hay otro cambio de Cuenta pendiente.")
             if self.status()["active"] and self.status()["active"]["slug"] == profile["slug"]:
                 return self.status()
-            self.switch_sessions()
+            sessions = self.switch_sessions()
             job = {"id": uuid.uuid4().hex, "requested": profile["slug"], "phase": "checking",
-                   "identity_verified": False}
+                   "previous": (self.status()["active"] or {}).get("slug"), "identity_verified": False,
+                   "owner_pid": os.getpid(), "owner_stamp": self.process_stamp(os.getpid())}
+            if sessions:
+                owner = sessions[0]
+                job.update(phase="requested", runtime=owner["id"], owner_pid=owner["pid"], owner_stamp=owner["stamp"])
+                self.write(self.root / "switch.json", job)
+                return self.status()
             self.write(self.root / "switch.json", job)
-            previous = store.BACKENDS["codex"].read_live()
-            try:
-                store.switch("codex", profile["slug"], verifier=self.verified_payload)
-                payload = store.BACKENDS["codex"].read_live()
-                with NativeServer(self.binary, self.environment(), cwd=self.root) as server:
-                    server.verify(payload)
-                job.update(phase="prepared", identity_verified=True)
-            except (NativeError, OSError, ValueError, subprocess.SubprocessError, store.SwitchError):
-                if previous:
-                    store.BACKENDS["codex"].write_live(previous)
-                job.update(phase="failed", error="No se pudo verificar la Cuenta. La selección anterior se conserva.")
+            self.prepare_selection(store, profile, job)
             self.write(self.root / "switch.json", job)
         return self.status()
+
+    def prepare_selection(self, store, profile, job):
+        previous = store.BACKENDS["codex"].read_live()
+        def terminate(signum, _frame):
+            raise SystemExit(128 + signum)
+        handlers = {sig: signal.signal(sig, terminate) for sig in (signal.SIGTERM, signal.SIGHUP)}
+        try:
+            store.switch("codex", profile["slug"], verifier=self.verified_payload)
+            with NativeServer(self.binary, self.environment(), cwd=self.root) as server:
+                self.verify_loaded(server, profile)
+            job.update(phase="prepared", identity_verified=True)
+        except (NativeError, OSError, ValueError, subprocess.SubprocessError, store.SwitchError):
+            self.restore_previous(previous)
+            job.update(phase="failed", error="No se pudo verificar la Cuenta. La selección anterior se conserva.")
+        except BaseException:
+            self.restore_previous(previous)
+            job.update(phase="failed", error="Se interrumpió el cambio. La selección anterior se conserva.")
+            self.write(self.root / "switch.json", job)
+            raise
+        finally:
+            for sig, handler in handlers.items():
+                signal.signal(sig, handler)
+
+    def start_tui(self, server, arguments, env):
+        return subprocess.Popen([self.binary, "--no-daemon", *AUTH_OPTIONS,
+                                 "--remote", "unix://" + str(server.endpoint), *arguments], env=env)
+
+    @staticmethod
+    def stop_tui(process):
+        if process and process.poll() is None:
+            process.terminate()
+            process.send_signal(signal.SIGCONT)
+            try:
+                process.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
+
+    def change_conversation(self, server, child, record, job, env):
+        store = self.store()
+        target = store.get_profile("codex", job["requested"])
+        original = store.get_profile("codex", record["profile"])
+        snapshot, previous = None, None
+        paused, stopped = False, False
+        replacement, next_child = None, None
+        try:
+            child.send_signal(signal.SIGSTOP)
+            paused = True
+            snapshot = server.snapshot()
+            job.update(phase="checking")
+            self.write(self.root / "switch.json", job)
+            payload = self.verified_payload("codex", target)
+            snapshot = server.snapshot()
+            job.update(phase="resuming", conversation=snapshot["id"])
+            self.write(self.root / "switch.json", job)
+            self.stop_tui(child)
+            paused, stopped = False, True
+            server.close()
+            previous = store.BACKENDS["codex"].read_live() or original["payload"]
+            store.switch("codex", target["slug"], verifier=lambda _kind, _profile: payload)
+            replacement = NativeServer(self.binary, env, cwd=os.getcwd()).start()
+            self.verify_loaded(replacement, target)
+            replacement.resume(snapshot)
+            next_child = self.start_tui(replacement, ["--cd", snapshot["cwd"], "resume", snapshot["id"]], env)
+            record.update(profile=target["slug"], thread_id=snapshot["id"])
+            self.write(self.root / "runtimes" / (record["id"] + ".json"), record)
+            job.update(phase="adopted", identity_verified=True)
+            self.write(self.root / "switch.json", job)
+            return replacement, next_child
+        except NativeBusy:
+            job.update(phase="waiting")
+        except (NativeError, OSError, ValueError, subprocess.SubprocessError, store.SwitchError) as error:
+            self.stop_tui(next_child)
+            if replacement:
+                replacement.close()
+            if stopped:
+                try:
+                    self.restore_previous(previous)
+                    replacement = NativeServer(self.binary, env, cwd=os.getcwd()).start()
+                    self.verify_loaded(replacement, original)
+                    replacement.resume(snapshot)
+                    next_child = self.start_tui(replacement, ["--cd", snapshot["cwd"], "resume", snapshot["id"]], env)
+                    server, child = replacement, next_child
+                    record.update(profile=original["slug"], thread_id=snapshot["id"])
+                    self.write(self.root / "runtimes" / (record["id"] + ".json"), record)
+                except (NativeError, OSError, ValueError, subprocess.SubprocessError, store.SwitchError):
+                    self.stop_tui(next_child)
+                    if replacement:
+                        replacement.close()
+                    raise NativeError("La Cuenta anterior está guardada; reanuda el hilo nativo para recuperar la sesión.") from None
+            job.update(phase="failed", error=str(error) if isinstance(error, NativeError)
+                       else "El cambio falló; la Cuenta y el hilo anteriores se conservan.")
+        except BaseException:
+            self.stop_tui(next_child)
+            if replacement:
+                replacement.close()
+            if stopped:
+                server.close()
+                if previous:
+                    self.restore_previous(previous)
+            job.update(phase="failed", identity_verified=False,
+                       error="El cambio se interrumpió antes de confirmarse; la selección anterior se conserva.")
+            self.write(self.root / "switch.json", job)
+            raise
+        finally:
+            if paused and child.poll() is None:
+                child.send_signal(signal.SIGCONT)
+        self.write(self.root / "switch.json", job)
+        return server, child
+
+    def native_conversation(self, arguments, env):
+        self.remember_core()
+        store = self.store()
+        with self.locked():
+            if self.selection_job().get("phase") in PENDING_SWITCH:
+                raise AccountError("Espera a que termine el cambio de Cuenta.")
+            profile = store.active_profile("codex")
+            record = {"id": uuid.uuid4().hex, "pid": os.getpid(), "stamp": self.process_stamp(os.getpid()),
+                      "terminal": os.environ.get("HC_TERMINAL_ID"), "profile": profile["slug"], "phase": "starting"}
+            path = self.root / "runtimes" / (record["id"] + ".json")
+            self.write(path, record)
+        server, child = None, None
+        try:
+            server = NativeServer(self.binary, env, cwd=os.getcwd()).start()
+            self.verify_loaded(server, profile)
+            child = self.start_tui(server, arguments, env)
+            record["phase"] = "ready"
+            self.write(path, record)
+            while child.poll() is None:
+                job = self.selection_job()
+                if job.get("runtime") == record["id"] and job.get("phase") in ("requested", "waiting"):
+                    with self.locked():
+                        server, child = self.change_conversation(server, child, record, job, env)
+                time.sleep(0.15)
+            return child.returncode
+        finally:
+            self.stop_tui(child)
+            if server:
+                server.close()
+            path.unlink(missing_ok=True)
 
     def mark_terminal(self, active=True):
         if active:
@@ -310,26 +509,33 @@ class Accounts:
             if result.returncode:
                 raise AccountError("No se pudo identificar este terminal como administrado.")
 
-    def managed_process(self, command, env):
+    def managed_process(self, command, env, *, interactive=False):
         # Herdr starts a normal shell when an explicit command exits. Release
         # our label before that shell appears; nested Codex keeps its shell's label.
         owns_label = not self.inherited_group
         if owns_label:
             self.mark_terminal()
+        owner_file = self.root / "owners" / (uuid.uuid4().hex + ".json")
+        self.write(owner_file, {"pid": os.getpid(), "stamp": self.process_stamp(os.getpid()),
+                                "terminal": os.environ.get("HC_TERMINAL_ID")})
         process = None
         previous = {}
         def terminate(signum, _frame):
             raise SystemExit(128 + signum)
         try:
-            process = subprocess.Popen(command, env=env)
             previous = {sig: signal.signal(sig, handler) for sig, handler in (
                 (signal.SIGINT, lambda _sig, _frame: None),
                 (signal.SIGTERM, terminate), (signal.SIGHUP, terminate))}
-            code = process.wait()
+            if interactive:
+                code = self.native_conversation(command, env)
+            else:
+                process = subprocess.Popen(command, env=env)
+                code = process.wait()
         finally:
             self.stop_process(process)
             for sig, handler in previous.items():
                 signal.signal(sig, handler)
+            owner_file.unlink(missing_ok=True)
             if owns_label:
                 self.mark_terminal(False)
         sys.exit(code if code >= 0 else 128 - code)
@@ -348,9 +554,37 @@ class Accounts:
                 raise AccountError("Gestiona el inicio de sesión desde el selector de Herdr.")
         if not self.status()["active"]:
             raise AccountError("Registra primero tu Cuenta desde el selector de Herdr.")
-        self.managed_process([self.binary, "--no-daemon", *AUTH_OPTIONS, *arguments], self.environment())
+        if self.selection_job().get("phase") in PENDING_SWITCH:
+            raise AccountError("Espera a que termine el cambio de Cuenta.")
+        arguments = [value for value in arguments if value != "--no-daemon"]
+        if self.is_interactive(arguments):
+            self.managed_process(arguments, self.environment(), interactive=True)
+        else:
+            self.managed_process([self.binary, "--no-daemon", *AUTH_OPTIONS, *arguments], self.environment())
 
-    def shell(self, arguments):
+    @staticmethod
+    def is_interactive(arguments):
+        if any(value in ("--version", "-V", "--help", "-h") for value in arguments):
+            return False
+        values = {"-c", "--config", "-m", "--model", "-p", "--profile", "-i", "--image",
+                  "--local-provider", "-s", "--sandbox", "-C", "--cd", "--add-dir", "-a",
+                  "--ask-for-approval", "--enable", "--disable"}
+        skip = False
+        for value in arguments:
+            if skip:
+                skip = False
+            elif value == "--":
+                break
+            elif value in values:
+                skip = True
+            elif not value.startswith("-"):
+                return value in ("resume", "fork", "agents") or value not in {
+                    "exec", "e", "review", "mcp", "plugin", "completion", "update", "doctor",
+                    "app-server", "remote-control", "app", "debug", "apply", "queue", "archive",
+                    "delete", "migrate-rollouts", "migrate-nfs-db", "unarchive", "cloud", "exec-server", "features"}
+        return True
+
+    def shell_environment(self):
         if not self.binary:
             raise AccountError("Codex no está disponible en este equipo.")
         wrapper = self.root / "bin" / "codex"
@@ -361,6 +595,10 @@ class Accounts:
         env = self.environment()
         env["PATH"] = str(wrapper.parent) + os.pathsep + env.get("PATH", "")
         env["HERDR_ACCOUNTS_CODEX_BINARY"] = self.binary
+        return env
+
+    def shell(self, arguments):
+        env = self.shell_environment()
         self.managed_process(["/bin/zsh", "-f", *arguments], env)
 
 
@@ -385,6 +623,9 @@ def main():
         print(json.dumps(result))
         return 0
     except AccountError as exc:
+        print(json.dumps({"error": str(exc)}))
+        return 1
+    except NativeError as exc:
         print(json.dumps({"error": str(exc)}))
         return 1
     except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError):

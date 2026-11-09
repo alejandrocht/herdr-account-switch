@@ -4,6 +4,35 @@ Recorded 2026-11-09. The user completed the official login, confirmed the first
 account and interactive launch, then accepted the selector and requested the
 next implementation ticket. Real-account results are recorded below.
 
+## Isolation regression — reopened
+
+Later the user reported that registering another account from the top-right
+button changed the login used outside Herdr. That report overrides the earlier
+isolation acceptance; #2 was reopened. Read-only checks found that the private
+profile remained the original account, while the global auth file had changed
+to a different identity. The private registration journal contained no second
+registration. This establishes the inconsistency, without proving the exact
+sequence of clicks that caused it.
+
+A regression using the actual mod callback, its public enrol command, the
+observed native macOS agent wrapper and fictitious credentials reproduced an
+escape: after login exits, an ordinary login shell can overwrite an external
+fixture's auth file. That test failed before replacing the selector's launcher
+with direct core launches and passed afterward.
+
+A real temporary Herdr core then checked the native wrapper and ordinary new
+terminals. It exposed a second boundary problem: macOS path_helper reordered
+PATH after .zshenv, putting the global Codex ahead of the private wrapper. The
+dedicated preview launcher now reapplies its private environment after system
+shell startup, configures a private recovery shell and uses a private core.
+The native regression checks effective CODEX_HOME, command resolution, managed
+terminal ownership and an unchanged external fixture. It passes without real
+credentials. A surviving terminal label alone no longer counts as ownership.
+
+These tests verify the reproduced escapes. Reconfirmation with the user's
+actual two accounts is still pending; do not treat the earlier first-account
+demonstration as proof of coexistence.
+
 ## Verified
 
 - Nine public controller integration tests passed with a temporary fake Codex:

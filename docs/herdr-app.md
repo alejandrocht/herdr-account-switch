@@ -1,77 +1,79 @@
-# Herdr App: first Codex account
+# Herdr App: Codex accounts
 
-The native App integration currently registers one Codex account, shows its
-identity, and opens an isolated Codex session or terminal. Additional accounts
-and conversation-preserving switching are subsequent tickets.
+The personal native selector registers accounts, keeps them saved, and selects
+one for Codex inside the dedicated Herdr preview. The current change coordinates
+one compatible conversation; multiple live conversations are rejected until #4.
+Real A → B → A validation remains required before closing #3.
 
-The App home and account home are separate from the source checkout. Credentials
-never belong in this repository. The controller requires an explicit account
-home and uses the upstream profile store inside that private home.
+## Install and open
 
-## Install into a preview
-
-Use a separate App home first. Supply your checkout's location and the existing
-Herdr App layout as the base:
+Keep the source checkout and its Python interpreter available. Credentials stay
+in the preview's private accounts directory, outside the source repository.
 
 ```sh
 python3 install_app.py --app-home /path/to/preview --base-layout /path/to/herdr-app/layouts/main.json
+python3 preview.py --app-home /path/to/preview
 ```
 
-This creates a personal layout named `codex-accounts` and a personal mod with
-the same name. It does not select the layout or change existing sessions.
-The generated mod configuration points at this checkout and the Python
-interpreter used for installation, so keep both available.
+Use `preview.py` or the generated `open-preview.command` to open the preview.
+Setting HERDR_APP_HOME alone does not establish the complete isolation boundary.
+The launcher configures a separate core, shell and recovery shell inside the
+preview, private Codex command resolution, and private macOS shell startup files.
+It never stops the usual Herdr core or changes its settings. Sessions in any
+earlier preview core remain running there; they are not silently migrated.
 
-Run a preview window with `HERDR_APP_HOME` pointing at that preview. Use a
-separate `HC_SESSION`, a short private `HC_SOCKET`, and scratch XDG directories
-for its core. macOS Unix socket paths must remain short. Never stop or restart
-the normal Herdr core to test this integration.
+The installer adds the personal `codex-accounts` layout and mod, and overrides
+Codex's menu command inside this preview only. Select that layout through Herdr's
+layout command. The top-right button opens the account selector.
 
-Select the personal layout through Herdr's layout command. The button appears
-at the right of the tab bar. The public mod command `codex-accounts.open` opens
-the same selector, useful for a key binding or a runtime check.
+## Register and select
 
-## Connect and use the account
+1. Choose **Conectar cuenta**, then complete the official browser login yourself.
+   The mod never receives your credentials. The login terminal closes on exit;
+   it does not fall back to an ordinary shell.
+2. Choose **Añadir cuenta** for each additional account. Each registration uses
+   a fresh temporary home, preserves the active account, and deduplicates an
+   already saved identity. Saved accounts do not require login on every switch.
+3. Open **Abrir Codex**, or choose **Terminal** and type `codex`. The selector
+   confirms a live managed process rather than trusting an old terminal label.
+   **Sesión externa** means the focused pane is outside this manager.
+4. Select a saved account. The selector distinguishes checking, waiting for an
+   active turn/tool, resuming, confirmed adoption and failure. It keeps the
+   previous effective account visible until adoption is verified.
+5. **Retomar conversación guardada** opens Codex's native resume picker. Use it
+   to reopen a conversation from an older managed launcher before switching.
 
-1. Choose **Conectar cuenta**. The official Codex login opens in a named tab
-   and the browser. Complete it yourself; the mod never receives your tokens.
-2. The selector shows the registered account after Codex confirms its login.
-3. Choose **Abrir Codex** for a managed conversation, or **Abrir terminal**
-   and type `codex` there.
-4. A pre-existing terminal remains outside this account group and is identified
-   as unadministered. Open a managed terminal instead of changing that session.
+An idle native conversation resumes by its original thread ID with its history
+and tool results. The manager never resends the last prompt or replays tools.
+A rejected target keeps the original session. A failed adoption restores the
+previous account and the same thread, preserving renewed target credentials.
+A completely empty conversation cannot resume before its first saved turn;
+complete a turn or close that empty session before preparing another account.
 
-Managed terminals use a clean zsh and a local Codex launcher. Personal shell
-startup files and the global Codex configuration are not imported. The launcher
-uses the private account home, removes inherited API-key authentication, and
-disables the shared Codex daemon. Login/logout and remote-account redirection
-are handled through the selector rather than the managed Codex command.
+The managed command blocks login/logout and auth/provider redirection; register
+accounts through the selector. The preview does not import global Codex config
+or personal shell startup files. Claude account management remains #6.
 
-When a managed program exits, its account label is released before Herdr returns
-to an ordinary shell. Codex commands inside a managed terminal keep that
-terminal's label until the managed shell itself exits.
-
-Cancelling the login terminates only the login process started for that
-registration. A failed login leaves the account list unchanged. Profiles and
-login state persist in the private account home, not in the App layout.
-
-## Validate
-
-The public controller tests run official-CLI-shaped fixtures in temporary
-directories; they never use an actual login or keychain:
+## Validate and recover
 
 ```sh
-python3 -m unittest test_herdr_accounts
+python3 -m unittest test_herdr_accounts test_preview
 python3 test_switcher.py
-python3 -m py_compile herdr_accounts.py install_app.py
+python3 -m py_compile herdr_accounts.py codex_runtime.py preview.py install_app.py
 herdr-app check /path/to/preview/mods/codex-accounts
 ```
 
-Inspect the empty, login-in-progress, error and connected states in the preview.
-Complete a real login, open a managed conversation, and check that its account
-identity matches the selector. This ticket does not claim a cross-account
-continuity test: that requires another real account and the following ticket.
+Controller tests use temporary fictitious accounts. `test_preview` additionally
+starts and stops only its own temporary native core, checking macOS fallback
+and ordinary new shells against an external auth sentinel. It skips if native
+Herdr/zsh are unavailable.
 
-Rollback removes the personal mod and layout, and stops using their managed
-terminals. Keep the account home unless you intentionally want to discard its
-saved logins. Other App layouts and external credential stores are unchanged.
+The live acceptance check must compare two distinct real identities, keep the
+same thread and tool results across A → B → A, and verify external applications
+retain their account. Do not infer this from a successful single-account login.
+See [the isolation regression](validation/ticket-2.md) and
+[native resume design](adr/0002-resume-native-codex-on-account-switch.md).
+
+To roll back, stop using this preview and its personal layout; keep the accounts
+directory to preserve saved logins. Normal Herdr and external apps retain their
+configuration. Activation in the normal App remains a later delivery (#7).

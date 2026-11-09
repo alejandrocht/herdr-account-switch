@@ -19,6 +19,10 @@ class NativeError(Exception):
     pass
 
 
+class NativeBusy(NativeError):
+    pass
+
+
 class NativeRPC:
     """The native Unix endpoint speaks uncompressed RFC 6455, not JSONL."""
     LIMIT = 64 * 1024 * 1024
@@ -167,6 +171,38 @@ class NativeServer:
         expected = payload.get("auth", {}).get("tokens", {}).get("access_token")
         if not expected or auth.get("authMethod") != "chatgpt" or auth.get("authToken") != expected:
             raise NativeError("La identidad efectiva de Codex no coincide con la Cuenta.")
+
+    def snapshot(self):
+        with self.connect() as rpc:
+            loaded = rpc.call("thread/loaded/list")["data"]
+            if len(loaded) != 1:
+                raise NativeError("Codex debe tener una única Conversación guardada para este cambio.")
+            metadata = rpc.call("thread/read", {"threadId": loaded[0], "includeTurns": False})["thread"]
+            if metadata.get("status", {}).get("type") == "active":
+                raise NativeBusy("La Conversación todavía está trabajando.")
+            if "path" in metadata and metadata["path"] is None:
+                raise NativeError("Envía un primer mensaje para que Codex guarde el hilo antes de cambiar de Cuenta.")
+            thread = rpc.call("thread/read", {"threadId": loaded[0], "includeTurns": True})["thread"]
+        if thread.get("status", {}).get("type") == "active":
+            raise NativeBusy("La Conversación todavía está trabajando.")
+        if thread.get("status", {}).get("type") != "idle":
+            raise NativeError("La Conversación no está preparada para reanudarse.")
+        if not thread.get("turns"):
+            raise NativeError("Envía un primer mensaje para que Codex guarde el hilo antes de cambiar de Cuenta.")
+        return thread
+
+    @staticmethod
+    def lineage(thread):
+        return [(turn.get("id"), [(item.get("id"), item.get("type")) for item in turn.get("items", [])])
+                for turn in thread.get("turns", [])]
+
+    def resume(self, previous):
+        with self.connect() as rpc:
+            restored = rpc.call("thread/resume", {"threadId": previous["id"]})["thread"]
+        before, after = self.lineage(previous), self.lineage(restored)
+        if restored.get("id") != previous["id"] or after[:len(before)] != before:
+            raise NativeError("Codex no confirmó la continuidad del hilo nativo.")
+        return restored
 
     def close(self):
         if self.process and self.process.poll() is None:

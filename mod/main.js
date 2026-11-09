@@ -1,6 +1,6 @@
 import { View, div, svg } from "gpui-kit";
 import { h_flex, v_flex } from "gpui-base";
-import { appHome, readTextFile, exec, openOverlay, closeOverlay, props, theme, run, focused, terminals, spaces, home, nextCommand } from "herdr";
+import { appHome, readTextFile, exec, hc, openOverlay, closeOverlay, props, theme, run, focused, spaces, home, nextCommand } from "herdr";
 
 export default class CodexAccounts extends View {
   init(_props, cx) {
@@ -8,8 +8,9 @@ export default class CodexAccounts extends View {
     this.config = null;
     this.busy = false;
     this.error = null;
+    this.statusError = null;
     this.handle = cx.focus_handle();
-    this.buttons = Object.fromEntries(["connect", "cancel-login", "open-codex", "open-shell"]
+    this.buttons = Object.fromEntries(["connect", "cancel-login", "open-codex", "open-shell", "resume"]
       .map(id => [id, cx.focus_handle()]));
     if (props()?.picker) this.handle.focus();
     cx.spawn(async (cx) => {
@@ -23,7 +24,7 @@ export default class CodexAccounts extends View {
     cx.spawn(async (cx) => {
       try {
         this.config = JSON.parse(await readTextFile(appHome() + "/mods/codex-accounts/config.json"));
-        await this.refresh();
+        await this.refresh(cx);
       } catch (_error) {
         this.error = "No se pudo cargar el selector. Revisa su instalación.";
       }
@@ -31,13 +32,13 @@ export default class CodexAccounts extends View {
     });
     cx.timer.every(3000, (cx) => {
       if (this.busy || !this.config) return;
-      cx.spawn(async (cx) => { await this.refresh(); cx.notify(); });
+      cx.spawn(async (cx) => { await this.refresh(cx); cx.notify(); });
     });
   }
 
   async call(action, args = []) {
     const c = this.config;
-    const result = await exec(c.python, [c.controller, "--home", c.accounts_home, action, ...args]);
+    const result = await exec(c.python, [c.controller, "--home", c.accounts_home, action, ...args], { timeout: 120000 });
     let data;
     try { data = JSON.parse(result.stdout); }
     catch (_error) { throw new Error("El gestor no respondió. Vuelve a intentarlo."); }
@@ -45,9 +46,15 @@ export default class CodexAccounts extends View {
     return data;
   }
 
-  async refresh() {
-    try { this.state = await this.call("status"); this.error = null; }
-    catch (error) { this.error = error.message; }
+  async refresh(cx) {
+    try {
+      this.state = await this.call("status");
+      for (const account of this.state.profiles ?? []) {
+        this.buttons["account-" + account.slug] ??= cx.focus_handle();
+      }
+      this.statusError = null;
+    }
+    catch (error) { this.statusError = error.message; }
   }
 
   action(name, args, cx) {
@@ -59,34 +66,52 @@ export default class CodexAccounts extends View {
       try {
         const result = await this.call(name, args);
         if (name === "enrol" && result.command) {
-          run("tab.new", { name: "Cuenta de Codex · Iniciar sesión", argv: result.command });
+          await this.openTerminal(result.command);
           if (props()?.overlay) closeOverlay(props().overlay);
         }
-        await this.refresh();
+        await this.refresh(cx);
       } catch (error) { this.error = error.message; }
       this.busy = false;
       cx.notify();
     });
   }
 
-  launch(command) {
+  async openTerminal(argv) {
+    // tab.new's macOS agent launcher returns to a regular login shell.
+    // Start the actual program in core so it exits with its private environment.
+    const result = await hc(["run", "--bg", "--json", "--no-parent", "--outlive-parent", "--no-notify",
+      "--cwd", focused()?.cwd ?? home(), "--", ...argv]);
+    if (result.code !== 0) throw new Error("No se pudo abrir el terminal de Herdr. Vuelve a intentarlo.");
+    const terminal = JSON.parse(result.stdout).address;
+    if (!terminal) throw new Error("Herdr no confirmó el terminal. Revisa el estado del registro.");
+    run("terminal.keep", { terminal, place: "tab" });
+    run("pane.focus", { terminal });
+  }
+
+  launch(command, cx, args = []) {
     const c = this.config;
     if (!c || !this.state?.active) return;
-    run("tab.new", { name: command === "shell" ? "Terminal de Codex" : "Codex · " + this.state.active.label,
-      folder: focused()?.cwd ?? home(),
-      argv: [c.python, c.controller, "--home", c.accounts_home, command] });
-    if (props()?.overlay) closeOverlay(props().overlay);
+    this.busy = true;
+    this.error = null;
+    cx.notify();
+    cx.spawn(async (cx) => {
+      try {
+        await this.openTerminal([c.python, c.controller, "--home", c.accounts_home, command, ...args]);
+        if (props()?.overlay) closeOverlay(props().overlay);
+      } catch (error) { this.error = error.message; }
+      this.busy = false;
+      cx.notify();
+    });
   }
 
   openPicker() {
-    openOverlay({ mod: "codex-accounts", props: { picker: true }, kind: "popup", width: 410, height: 330 });
+    openOverlay({ mod: "codex-accounts", props: { picker: true }, kind: "popup", width: 410, height: 430 });
   }
 
   managed() {
     const address = focused()?.terminal;
     if (!address) return null;
-    const terminal = terminals().find(t => t.address === address || t.id === address);
-    return terminal?.labels?.["herdr.accounts"] === this.config?.accounts_home;
+    return Boolean(this.state?.managed_terminals?.includes(address));
   }
 
   remote() { return Boolean(spaces().find(s => s.active)?.machine); }
@@ -113,10 +138,14 @@ export default class CodexAccounts extends View {
     const t = theme();
     const pending = this.state?.state === "enrolling";
     const active = this.state?.active;
+    const profiles = this.state?.profiles ?? [];
+    const phase = this.state?.switch?.phase;
+    const switching = ["requested", "waiting", "checking", "resuming"].includes(phase);
     const unavailable = this.state && !this.state.available;
     const disabled = this.busy || !this.config || !this.state || unavailable || this.remote();
     if (!props()?.picker) {
-      const label = this.error ? "Revisar cuenta" : unavailable ? "No disponible" : pending ? "Iniciando sesión" : active?.label ?? "Conectar cuenta";
+      const label = this.error || this.statusError ? "Revisar cuenta" : unavailable ? "No disponible" : pending ? "Iniciando sesión"
+        : switching ? "Cambiando cuenta" : active && this.managed() === false ? "Sesión externa" : active?.label ?? "Conectar cuenta";
       return h_flex().track_focus(this.handle).size_full().px(8).items_center().justify_end()
         .bg(t.chrome).border_b(1).border_color(t.border)
         .on_key_down((e, cx) => {
@@ -131,10 +160,10 @@ export default class CodexAccounts extends View {
           .child(svg("mods/codex-accounts/chevron.svg").size(12).text_color(t.dim)));
     }
     const note = this.remote() ? "El selector está disponible en este equipo."
-      : this.managed() === false ? "Esta pestaña usa una sesión no administrada. Abre Codex desde aquí para usar esta cuenta."
-      : "Cuenta para Codex en Herdr.";
+      : this.managed() === false ? "Esta pestaña está fuera del gestor. Abre Codex desde aquí o retoma una conversación guardada."
+      : "Elige la cuenta para Codex en Herdr.";
     const actionIds = disabled ? [] : pending ? ["cancel-login"]
-      : active ? ["open-codex", "open-shell"] : ["connect"];
+      : switching ? [] : active ? [...profiles.map(p => "account-" + p.slug), "connect", "open-codex", "open-shell", "resume"] : ["connect"];
     return v_flex().id("codex-accounts-panel").track_focus(this.handle)
       .on_key_down((e, cx) => {
         if (e.key === "escape") { closeOverlay(props().overlay); cx.stop_propagation(); }
@@ -149,38 +178,59 @@ export default class CodexAccounts extends View {
         }
         if ((e.key === "enter" || e.key === "space") && !disabled && this.handle.is_focused()) {
           if (pending) this.action("cancel", [this.state.login.id], cx);
-          else if (active) this.launch("launch");
+          else if (active && !switching) this.launch("launch", cx);
           else this.action("enrol", [], cx);
           cx.stop_propagation();
         }
-      }).w(410).h(330).p(18).gap(14).bg(t.popover).text_color(t.foreground)
+      }).w(410).h(430).p(18).gap(14).bg(t.popover).text_color(t.foreground)
       .child(h_flex().items_center().gap(10)
         .child(svg("mods/codex-accounts/account.svg").size(19).text_color(t.accent))
-        .child(div().flex_1().text_size(16).font_semibold().child("Cuenta de Codex"))
+        .child(div().flex_1().text_size(16).font_semibold().child("Cuentas de Codex"))
         .child(div().text_size(11).text_color(t.muted).child("Esc para cerrar")))
-      .child(v_flex().h(190).flex_shrink_0().gap(14).overflow_y_scrollbar()
+      .child(v_flex().flex_1().min_h(0).gap(12).overflow_y_scrollbar()
       .child(div().text_size(12.5).text_color(t.muted).child(note))
       .when(Boolean(unavailable), el => el.child(v_flex().gap(5)
         .child(div().text_size(14).font_medium().child("Codex no está disponible"))
         .child(div().text_size(12.5).text_color(t.muted).child("Instala Codex y vuelve a intentarlo. Tu cuenta guardada se conserva."))))
-      .when(Boolean(active), el => el.child(v_flex().gap(5).py(10)
-        .child(h_flex().gap(8).items_center()
-          .child(div().size(6).rounded(3).bg(t.done))
-          .child(div().text_size(14).font_medium().truncate().child(active.label)))
-        .child(div().text_size(12).text_color(t.muted).truncate().child(active.email ?? "Cuenta conectada"))))
+      .children(profiles.map(account => {
+        const id = "account-" + account.slug;
+        const handle = this.buttons[id];
+        const current = active?.slug === account.slug;
+        const requested = switching && this.state.switch.requested === account.slug;
+        const choose = cx => { if (!disabled && !pending && !switching) this.action("select", [account.slug], cx); };
+        return h_flex().id(id).track_focus(handle).tab_index(0).tab_stop(!disabled && !pending && !switching)
+          .p(10).gap(10).rounded(8).border_1().border_color(handle.is_focused() ? t.accent : current ? t.input : t.border)
+          .bg(current ? t.selected : t.popover).items_center().cursor_pointer()
+          .hover(s => s.bg(t.hover)).on_click((_event, cx) => choose(cx))
+          .on_key_down((event, cx) => {
+            if (event.key === "enter" || event.key === "space") { choose(cx); cx.stop_propagation(); }
+          })
+          .child(v_flex().flex_1().min_w(0).gap(4)
+            .child(div().text_size(13).font_medium().truncate().child(account.label))
+            .child(div().text_size(12).text_color(t.muted).truncate().child(account.email ?? "Cuenta guardada")))
+          .child(div().text_size(11).text_color(t.muted).child(requested ? "Solicitada" : current ? "En uso" : "Usar"));
+      }))
       .when(!active && !pending && !unavailable, el => el.child(v_flex().gap(5).py(8)
         .child(div().text_size(14).font_medium().child("Conecta tu cuenta de ChatGPT"))
         .child(div().text_size(12.5).text_color(t.muted).child("El inicio de sesión se abrirá en tu navegador."))))
       .when(Boolean(pending), el => el.child(v_flex().gap(6).py(10)
         .child(div().text_size(14).font_medium().child("Completa el inicio de sesión"))
         .child(div().text_size(12.5).text_color(t.muted).child("Continúa en el navegador. Esta ventana se actualizará al terminar."))))
-      .when(Boolean(this.error || this.state?.login?.error), el => el.child(div().text_size(12).text_color(t.blocked)
-        .child(this.error ?? this.state.login.error))))
+      .when(Boolean(switching), el => el.child(div().text_size(12.5).text_color(t.muted)
+        .child(phase === "waiting" ? "Esperando a que termine la respuesta o herramienta en curso…"
+          : phase === "resuming" ? "Retomando la misma conversación…" : "Comprobando la cuenta elegida…")))
+      .when(phase === "adopted", el => el.child(div().text_size(12).text_color(t.muted).child("Cambio confirmado en el mismo hilo.")))
+      .when(phase === "prepared", el => el.child(div().text_size(12).text_color(t.muted).child("Cuenta lista para abrir Codex.")))
+      .when(Boolean(this.state?.login?.duplicate) && !pending, el => el.child(div().text_size(12).text_color(t.muted).child("Esta cuenta ya estaba guardada.")))
+      .when(Boolean(this.error || this.statusError || this.state?.login?.error || this.state?.switch?.error), el => el.child(div().text_size(12).text_color(t.blocked)
+        .child(this.error ?? this.statusError ?? this.state?.login?.error ?? this.state?.switch?.error)))
+      .when(Boolean(active) && !pending && !switching, el => el.child(this.button("resume", "Retomar conversación guardada", false, disabled,
+        cx => this.launch("launch", cx, ["--", "resume"])))))
       .child(h_flex().gap(8)
-        .when(!active && !pending, el => el.child(this.button("connect", "Conectar cuenta", true, disabled, cx => this.action("enrol", [], cx))))
+        .when(!pending, el => el.child(this.button("connect", active ? "Añadir cuenta" : "Conectar cuenta", !active, disabled || switching, cx => this.action("enrol", [], cx))))
         .when(Boolean(pending), el => el.child(this.button("cancel-login", "Cancelar inicio de sesión", false, disabled, cx => this.action("cancel", [this.state.login.id], cx))))
         .when(Boolean(active) && !pending, el => el
-          .child(this.button("open-codex", "Abrir Codex", true, disabled, () => this.launch("launch")))
-          .child(this.button("open-shell", "Abrir terminal", false, disabled, () => this.launch("shell")))));
+          .child(this.button("open-codex", "Abrir Codex", true, disabled || switching, cx => this.launch("launch", cx)))
+          .child(this.button("open-shell", "Terminal", false, disabled || switching, cx => this.launch("shell", cx)))));
   }
 }

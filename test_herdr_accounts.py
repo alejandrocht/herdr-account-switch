@@ -2,6 +2,9 @@
 import json
 import os
 import signal
+import shutil
+import queue
+import threading
 from pathlib import Path
 import subprocess
 import sys
@@ -28,10 +31,45 @@ class AccountFlow(unittest.TestCase):
             if key.startswith("HC_"):
                 self.env.pop(key)
         self.env.pop("HERDR_ACCOUNT_GROUP", None)
+        self.provider_state = self.root / "provider.json"
+        self.provider_state.write_text("{}")
+        self.env["HERDR_TEST_PROVIDER_STATE"] = str(self.provider_state)
 
     def command(self, *args):
         return [sys.executable, str(CONTROLLER), "--home", str(self.managed),
                 "--codex", str(self.binary), *args]
+
+    @unittest.skipUnless(shutil.which("node") and Path("/bin/zsh").exists(), "native mod launch harness")
+    def test_account_button_never_leaves_a_shell_with_the_external_login(self):
+        external = self.root / "external-codex"
+        external.mkdir()
+        sentinel = external / "auth.json"
+        sentinel.write_text("external-login-must-not-change")
+        dotdir = self.root / "shell-config"
+        dotdir.mkdir()
+        env = dict(self.env, CODEX_HOME=str(external), CODEX_SQLITE_HOME=str(external),
+                   ZDOTDIR=str(dotdir), HERDR_ACCOUNTS_CODEX_BINARY=str(self.binary),
+                   HERDR_TEST_MOD_CONFIG=json.dumps({"python": sys.executable,
+                       "controller": str(CONTROLLER), "accounts_home": str(self.managed)}))
+        result = subprocess.run(["node", "--experimental-vm-modules",
+            str(CONTROLLER.parent / "tests/fixtures/account_button.mjs"),
+            str(CONTROLLER.parent / "mod/main.js")], env=env,
+            capture_output=True, text=True, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        launches = json.loads(result.stdout)
+        self.assertEqual(len(launches), 1)
+        launch = launches[0]
+        argv = launch["argv"]
+        if launch["route"] == "agent-menu":
+            # Exact macOS agent wrapper observed in hc get: the account command
+            # returns to an ordinary login shell. Never load the user's profiles.
+            argv = ["/bin/zsh", "-lic", '\"$@\"; exec \"$0\" -li', "/bin/zsh", *argv]
+        probe = subprocess.run(argv, env=env, cwd=self.root,
+            input=str(self.binary) + " login\nexit\n", capture_output=True, text=True, timeout=10)
+        self.assertEqual(probe.returncode, 0, probe.stderr)
+        self.assertTrue((self.managed / "codex/auth.json").exists())
+        self.assertTrue(sentinel.read_text() == "external-login-must-not-change",
+                         "The account button returned to a shell that can overwrite the external login")
 
     def call(self, *args, ok=True):
         result = subprocess.run(self.command(*args), env=self.env,
@@ -58,6 +96,216 @@ class AccountFlow(unittest.TestCase):
             self.assertLess(time.monotonic(), deadline)
             time.sleep(0.02)
         return pending, worker
+
+    def interactive_conversation(self):
+        worker = subprocess.Popen(self.command("launch"), env=self.env, cwd=self.root,
+                                  stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                  text=True, start_new_session=True)
+        worker.events = queue.Queue()
+        def read():
+            for line in worker.stdout:
+                worker.events.put(line)
+            worker.events.put(None)
+        reader = threading.Thread(target=read, daemon=True)
+        reader.start()
+        def close():
+            if worker.poll() is None:
+                worker.terminate()
+            worker.wait(timeout=10)
+            reader.join(timeout=1)
+            worker.stdin.close()
+            worker.stdout.close()
+            worker.stderr.close()
+        self.addCleanup(close)
+        return worker
+
+    def next_event(self, worker, *, working=False):
+        while True:
+            line = worker.events.get(timeout=15)
+            self.assertTrue(line, "El Agente terminó antes de confirmar la operación")
+            self.assertNotIn("FIXTURE_SECRET", line)
+            event = json.loads(line)
+            if working or event.get("event") != "working":
+                return event
+
+    def set_provider(self, **values):
+        staged = self.provider_state.with_suffix(".tmp")
+        state = json.loads(self.provider_state.read_text())
+        state.update(values)
+        staged.write_text(json.dumps(state))
+        staged.replace(self.provider_state)
+
+    def two_accounts(self):
+        first = self.call("enrol")
+        self.call("login", first["login_id"])
+        self.env["HERDR_TEST_ACCOUNT"] = "second"
+        second = self.call("enrol")
+        self.call("login", second["login_id"])
+
+    def phase(self, expected):
+        deadline = time.monotonic() + 10
+        while True:
+            state = self.call("status")
+            if state["switch"].get("phase") == expected:
+                return state
+            self.assertLess(time.monotonic(), deadline, state["switch"])
+            time.sleep(0.02)
+
+    def test_a_rejected_target_keeps_the_running_thread_and_account(self):
+        self.two_accounts()
+        worker = self.interactive_conversation()
+        ready = self.next_event(worker)
+        worker.stdin.write("write-once\n")
+        worker.stdin.flush()
+        self.next_event(worker)
+        self.set_provider(rejected=["second-account"])
+        self.call("select", "second")
+        failed = self.phase("failed")
+        self.assertEqual(failed["active"]["label"], "demo")
+        self.assertFalse(failed["switch"]["identity_verified"])
+        worker.stdin.write("continue\n")
+        worker.stdin.flush()
+        result = self.next_event(worker)
+        self.assertEqual(result["thread_id"], ready["thread_id"])
+        self.assertEqual(result["account"], "demo-account")
+        self.assertEqual((self.root / "work.txt").read_text(), "1")
+
+    def test_failed_effective_adoption_restores_the_original_native_thread(self):
+        self.two_accounts()
+        worker = self.interactive_conversation()
+        ready = self.next_event(worker)
+        worker.stdin.write("write-once\n")
+        worker.stdin.flush()
+        original = self.next_event(worker)
+        self.set_provider(reject_activation="second-account", live_home=str(self.managed / "codex"))
+        self.call("select", "second")
+        restored = self.next_event(worker)
+        self.assertEqual(restored["thread_id"], ready["thread_id"])
+        self.assertEqual(restored["history"], original["history"])
+        self.assertEqual(self.phase("failed")["active"]["label"], "demo")
+        self.assertEqual((self.root / "work.txt").read_text(), "1")
+
+    def test_switch_waits_for_a_running_tool_to_finish(self):
+        self.two_accounts()
+        worker = self.interactive_conversation()
+        ready = self.next_event(worker)
+        self.set_provider(hold_turns=True)
+        worker.stdin.write("write-once\n")
+        worker.stdin.flush()
+        self.assertEqual(self.next_event(worker, working=True)["event"], "working")
+        self.call("select", "second")
+        pending = self.phase("waiting")
+        self.assertEqual(pending["active"]["label"], "demo")
+        self.assertFalse((self.root / "work.txt").exists())
+        self.set_provider(hold_turns=False)
+        while True:
+            result = self.next_event(worker)
+            if result["event"] == "ready":
+                break
+        self.assertEqual(result["thread_id"], ready["thread_id"])
+        self.assertEqual((self.root / "work.txt").read_text(), "1")
+        self.assertEqual(self.phase("adopted")["active"]["label"], "second")
+
+    def test_rollback_parks_credentials_renewed_by_the_target_agent(self):
+        self.two_accounts()
+        worker = self.interactive_conversation()
+        original = self.next_event(worker)
+        worker.stdin.write("write-once\n")
+        worker.stdin.flush()
+        self.next_event(worker)
+        self.set_provider(refresh_live="second-account", reject_resume="second-account",
+                          live_home=str(self.managed / "codex"))
+        self.call("select", "second")
+        restored = self.next_event(worker)
+        self.assertEqual(restored["thread_id"], original["thread_id"])
+        self.assertEqual(self.phase("failed")["active"]["label"], "demo")
+        self.set_provider(refresh_live=None, reject_resume=None)
+        self.call("select", "second")
+        self.assertEqual(self.phase("adopted")["active"]["label"], "second")
+        self.assertEqual(self.next_event(worker)["thread_id"], original["thread_id"])
+        self.assertEqual((self.root / "work.txt").read_text(), "1")
+
+    def test_interrupting_an_unconfirmed_change_restores_the_previous_account(self):
+        self.two_accounts()
+        worker = self.interactive_conversation()
+        self.next_event(worker)
+        worker.stdin.write("write-once\n")
+        worker.stdin.flush()
+        self.next_event(worker)
+        self.set_provider(hold_resume="second-account")
+        self.call("select", "second")
+        deadline = time.monotonic() + 10
+        while not json.loads(self.provider_state.read_text()).get("resume_waiting"):
+            self.assertLess(time.monotonic(), deadline)
+            time.sleep(0.02)
+        worker.terminate()
+        worker.wait(timeout=10)
+        self.assertEqual(self.call("status")["active"]["label"], "demo")
+        self.assertEqual((self.root / "work.txt").read_text(), "1")
+
+    def test_select_cannot_overlap_an_unfinished_registration(self):
+        self.two_accounts()
+        self.running_login()
+        rejected = self.call("select", "second", ok=False)
+        self.assertIn("registro", rejected["error"].lower())
+        self.assertEqual(self.call("status")["active"]["label"], "demo")
+
+    def test_interrupting_a_cold_selection_restores_the_previous_account(self):
+        self.two_accounts()
+        self.set_provider(hold_activation="second-account", live_home=str(self.managed / "codex"))
+        worker = subprocess.Popen(self.command("select", "second"), env=self.env,
+                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        def cleanup():
+            if worker.poll() is None:
+                worker.terminate()
+            worker.communicate(timeout=5)
+            state = json.loads(self.provider_state.read_text())
+            pid = state.get("activation_pid")
+            if pid:
+                command = subprocess.run(["/bin/ps", "-p", str(pid), "-o", "command="],
+                                         capture_output=True, text=True).stdout
+                if str(self.binary) in command:
+                    os.kill(pid, signal.SIGTERM)
+        self.addCleanup(cleanup)
+        deadline = time.monotonic() + 6
+        while not json.loads(self.provider_state.read_text()).get("activation_waiting"):
+            self.assertLess(time.monotonic(), deadline)
+            time.sleep(0.02)
+        worker.terminate()
+        worker.communicate(timeout=5)
+        state = self.call("status")
+        self.assertEqual(state["active"]["label"], "demo")
+        self.assertEqual(state["switch"]["phase"], "failed")
+
+    def test_switch_cycle_preserves_the_native_thread_and_does_not_repeat_its_tool(self):
+        first = self.call("enrol")
+        self.call("login", first["login_id"])
+        self.env["HERDR_TEST_ACCOUNT"] = "second"
+        second = self.call("enrol")
+        self.call("login", second["login_id"])
+        worker = self.interactive_conversation()
+        started = self.next_event(worker)
+        self.assertEqual(started["event"], "ready")
+        worker.stdin.write("write-once\n")
+        worker.stdin.flush()
+        original = self.next_event(worker)
+        self.assertEqual(original["account"], "demo-account")
+        requested = self.call("select", "second")
+        self.assertIn(requested["switch"]["phase"], ("requested", "checking", "resuming", "adopted"))
+        resumed = self.next_event(worker)
+        self.assertEqual(resumed["event"], "ready")
+        self.assertEqual(resumed["thread_id"], started["thread_id"])
+        self.assertEqual(resumed["history"], original["history"])
+        worker.stdin.write("continue\n")
+        worker.stdin.flush()
+        continued = self.next_event(worker)
+        self.assertEqual(continued["account"], "second-account")
+        self.assertEqual((self.root / "work.txt").read_text(), "1")
+        self.call("select", "demo")
+        returned = self.next_event(worker)
+        self.assertEqual(returned["thread_id"], started["thread_id"])
+        self.assertEqual(returned["history"], continued["history"])
+        self.assertEqual((self.root / "work.txt").read_text(), "1")
 
     def test_empty_selector_identifies_codex_without_reading_an_external_login(self):
         outside = self.root / "outside"
@@ -90,6 +338,26 @@ class AccountFlow(unittest.TestCase):
         self.call("login", second["login_id"])
         state = self.call("status")
         self.assertEqual({p["label"] for p in state["profiles"]}, {"demo", "second"})
+        self.assertEqual(state["active"]["label"], "demo")
+
+    def test_saved_accounts_deduplicate_without_a_three_account_limit(self):
+        for name in ("demo", "second", "third", "fourth", "second"):
+            self.env["HERDR_TEST_ACCOUNT"] = name
+            pending = self.call("enrol")
+            self.call("login", pending["login_id"])
+        state = self.call("status")
+        self.assertEqual(len(state["profiles"]), 4)
+        self.assertTrue(state["login"]["duplicate"])
+        self.assertEqual(state["active"]["label"], "demo")
+
+    def test_a_failed_additional_login_keeps_the_saved_and_active_account(self):
+        pending = self.call("enrol")
+        self.call("login", pending["login_id"])
+        pending = self.call("enrol")
+        self.env["HERDR_TEST_LOGIN"] = "fail"
+        self.call("login", pending["login_id"], ok=False)
+        state = self.call("status")
+        self.assertEqual(len(state["profiles"]), 1)
         self.assertEqual(state["active"]["label"], "demo")
 
     def test_a_saved_account_can_be_selected_without_another_browser_login(self):
@@ -147,7 +415,7 @@ class AccountFlow(unittest.TestCase):
     def test_launch_uses_only_the_registered_herdr_identity(self):
         pending = self.call("enrol")
         self.call("login", pending["login_id"])
-        result = self.call("launch", "--", "--model", "demo")
+        result = self.call("launch", "--", "exec", "--model", "demo")
         self.assertEqual(result["codex_home"], str(self.managed / "codex"))
         self.assertEqual(result["sqlite_home"], str(self.managed / "codex"))
         self.assertEqual(result["group"], str(self.managed))
@@ -173,7 +441,7 @@ class AccountFlow(unittest.TestCase):
     def test_normal_codex_command_inside_a_managed_terminal_stays_isolated(self):
         pending = self.call("enrol")
         self.call("login", pending["login_id"])
-        result = self.call("shell", "--", "-c", "codex --model demo")
+        result = self.call("shell", "--", "-c", "codex exec --model demo")
         self.assertEqual(result["codex_home"], str(self.managed / "codex"))
         self.assertEqual(result["group"], str(self.managed))
         self.assertIsNone(result["api_key"])
