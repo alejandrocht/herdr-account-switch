@@ -15,6 +15,9 @@ import uuid
 
 
 args = sys.argv[1:]
+if "--no-daemon" in args and "--remote" in args:
+    print("ERROR: --no-daemon cannot be used with --remote.", file=sys.stderr)
+    sys.exit(1)
 auth_file = Path(os.environ["CODEX_HOME"]) / "auth.json"
 
 

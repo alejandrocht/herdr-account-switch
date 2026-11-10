@@ -381,7 +381,9 @@ class Accounts:
                 signal.signal(sig, handler)
 
     def start_tui(self, server, arguments, env):
-        return subprocess.Popen([self.binary, "--no-daemon", *AUTH_OPTIONS,
+        # --remote already selects our owned server. --no-daemon belongs on
+        # that server's launch; the native CLI rejects both flags on the TUI.
+        return subprocess.Popen([self.binary, *AUTH_OPTIONS,
                                  "--remote", "unix://" + str(server.endpoint), *arguments], env=env)
 
     @staticmethod

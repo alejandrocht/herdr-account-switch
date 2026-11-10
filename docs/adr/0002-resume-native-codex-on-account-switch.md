@@ -23,6 +23,10 @@ conectada a su socket Unix privado. El protocolo del socket es WebSocket; el
 adaptador usa biblioteca estándar y no abre un puerto de red. Los directorios
 del socket y del estado son privados y las credenciales nunca llegan al mod.
 
+El app-server propio lleva `--no-daemon`; la TUI usa `--remote` sin esa opción,
+porque Codex 0.167.0 rechaza combinarlas. La regresión se verifica también
+contra el ejecutable instalado, no solo con el Agente simulado.
+
 El cambio primero valida B en un entorno temporal. Solo después, en un punto
 inactivo del hilo, detiene sus procesos propios, conserva las credenciales más
 recientes de A, aplica B y verifica las credenciales que cargó el servidor nuevo.

@@ -59,6 +59,18 @@ inspected locally. No new real login, account switch or model request was made.
 
 ## Limits and remaining acceptance
 
+### Native startup follow-up
+
+The user reported that opening Codex failed because the real CLI rejected
+`--no-daemon` together with `--remote`. This exposed a gap in the permissive
+fixture. The client flag was removed, the server flag retained, the fixture
+made strict, and an installed-CLI PTY regression added. Native pane adoption
+was corrected using core labels and waiting for the pane before focus.
+The 27 tests passed; a real first-account TUI was then verified running and
+visible. The second-account login was opened in the same App and deferred by
+the user, so only that pending registration was cancelled. First-account Codex
+remains open. See [the reproduction](../solutions/codex-remote-tui-startup.md).
+
 Spec review identified reuse of an already open preview as an isolation gap:
 bare Herdr only raises it, so changing controller metadata cannot change that
 window's environment. A public-launcher regression reproduced this before the

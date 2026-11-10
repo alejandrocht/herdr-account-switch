@@ -1,6 +1,6 @@
 import { View, div, svg } from "gpui-kit";
 import { h_flex, v_flex } from "gpui-base";
-import { appHome, readTextFile, exec, hc, openOverlay, closeOverlay, props, theme, run, focused, spaces, home, nextCommand } from "herdr";
+import { appHome, readTextFile, exec, hc, openOverlay, closeOverlay, props, theme, run, focused, spaces, panes, home, nextCommand } from "herdr";
 
 export default class CodexAccounts extends View {
   init(_props, cx) {
@@ -19,6 +19,7 @@ export default class CodexAccounts extends View {
         if (command === "focus") this.handle.focus();
         if (command === "open" && !props()?.picker) this.openPicker();
         if (command === "connect" && !props()?.picker && !this.remote()) this.action("enrol", [], cx);
+        if (command === "launch" && !props()?.picker && !this.remote()) this.launch("launch", cx);
       }
     });
     cx.spawn(async (cx) => {
@@ -66,7 +67,7 @@ export default class CodexAccounts extends View {
       try {
         const result = await this.call(name, args);
         if (name === "enrol" && result.command) {
-          await this.openTerminal(result.command);
+          await this.openTerminal(result.command, cx);
           if (props()?.overlay) closeOverlay(props().overlay);
         }
         await this.refresh(cx);
@@ -76,16 +77,25 @@ export default class CodexAccounts extends View {
     });
   }
 
-  async openTerminal(argv) {
+  async openTerminal(argv, cx) {
     // tab.new's macOS agent launcher returns to a regular login shell.
     // Start the actual program in core so it exits with its private environment.
+    const id = Array.from({ length: 32 }, () => Math.floor(Math.random() * 16).toString(16)).join("");
+    const space = spaces().find(s => s.active)?.id ?? "sp" + id;
     const result = await hc(["run", "--bg", "--json", "--no-parent", "--outlive-parent", "--no-notify",
+      "--label", "herdr.space=" + space, "--label", "herdr.tab=tb" + id,
       "--cwd", focused()?.cwd ?? home(), "--", ...argv]);
     if (result.code !== 0) throw new Error("No se pudo abrir el terminal de Herdr. Vuelve a intentarlo.");
     const terminal = JSON.parse(result.stdout).address;
     if (!terminal) throw new Error("Herdr no confirmó el terminal. Revisa el estado del registro.");
-    run("terminal.keep", { terminal, place: "tab" });
-    run("pane.focus", { terminal });
+    // Core labels request native adoption even before the app knows this
+    // terminal. Wait only for this action's pane before asking it to focus.
+    for (let attempt = 0; attempt < 100; attempt++) {
+      const pane = panes().find(p => p.terminal === terminal);
+      if (pane) { run("pane.focus", { pane: pane.pane }); return; }
+      await cx.sleep(50);
+    }
+    throw new Error("El terminal se inició, pero Herdr no pudo mostrar su pestaña. Reabre esta ventana; tu cuenta sigue guardada.");
   }
 
   launch(command, cx, args = []) {
@@ -96,7 +106,7 @@ export default class CodexAccounts extends View {
     cx.notify();
     cx.spawn(async (cx) => {
       try {
-        await this.openTerminal([c.python, c.controller, "--home", c.accounts_home, command, ...args]);
+        await this.openTerminal([c.python, c.controller, "--home", c.accounts_home, command, ...args], cx);
         if (props()?.overlay) closeOverlay(props().overlay);
       } catch (error) { this.error = error.message; }
       this.busy = false;
