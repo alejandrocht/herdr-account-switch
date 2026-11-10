@@ -7,7 +7,8 @@ after the user's isolation regression report; see its validation document.
 
 ## Automated evidence
 
-- `python3 -m unittest -q test_herdr_accounts test_preview`: 26 tests passed.
+- `python3 -m unittest -q test_herdr_accounts test_preview test_native_codex`:
+  27 tests passed, including the native-startup regression below.
   Temporary credentials only; no real browser login or global credential writes.
   Every public controller operation and test cleanup now compares external auth,
   configuration, SQLite and profile-store controls, including cycles/rollback.
@@ -70,6 +71,10 @@ The 27 tests passed; a real first-account TUI was then verified running and
 visible. The second-account login was opened in the same App and deferred by
 the user, so only that pending registration was cancelled. First-account Codex
 remains open. See [the reproduction](../solutions/codex-remote-tui-startup.md).
+
+Independent correction review of `a062fa1...421deb1`: Standards zero hard
+violations/heuristic findings; Spec zero findings. This review covers the native
+launch/adoption correction and does not remove the two-real-account gate.
 
 Spec review identified reuse of an already open preview as an isolation gap:
 bare Herdr only raises it, so changing controller metadata cannot change that

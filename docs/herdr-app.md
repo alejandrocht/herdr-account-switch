@@ -60,7 +60,7 @@ or personal shell startup files. Claude account management remains #6.
 ## Validate and recover
 
 ```sh
-python3 -m unittest test_herdr_accounts test_preview
+python3 -m unittest test_herdr_accounts test_preview test_native_codex
 python3 test_switcher.py
 python3 -m py_compile herdr_accounts.py codex_runtime.py preview.py install_app.py
 herdr-app check /path/to/preview/mods/codex-accounts
@@ -70,6 +70,10 @@ Controller tests use temporary fictitious accounts. `test_preview` additionally
 starts and stops only its own temporary native core, checking macOS fallback
 and ordinary new shells against an external auth sentinel. It skips if native
 Herdr/zsh are unavailable.
+
+`test_native_codex` checks the production TUI arguments against the installed
+Codex CLI in an empty temporary home and PTY. It makes no model request or
+login and skips when the local CLI or PTY is unavailable.
 
 The live acceptance check must compare two distinct real identities, keep the
 same thread and tool results across A → B → A, and verify external applications
